@@ -1,0 +1,1199 @@
+const { ethers } = require('ethers');
+const ExistingWallet = require('../models/ExistingWallet');
+const TransactionRecord = require('../models/TransactionRecord');
+const blockchainService = require('./blockchain');
+const priceFeed = require('./priceFeed');
+require('dotenv').config();
+
+class BlockchainWatcher {
+  constructor() {
+    // Just use the standard Base RPC URL
+    const rpcUrl = process.env.BASE_RPC_URL;
+    console.log(`Using RPC endpoint: ${rpcUrl}`);
+    
+    // Check if we have an Alchemy URL to use (higher rate limits)
+    const alchemyUrl = process.env.ALCHEMY_BASE_RPC_URL;
+    const providerUrl = alchemyUrl || rpcUrl;
+    
+    if (alchemyUrl) {
+      console.log(`Using Alchemy RPC endpoint for higher rate limits`);
+    }
+    
+    // Create the provider with improved settings for rate limiting
+    // Use more conservative settings for mainnet
+    this.provider = new ethers.JsonRpcProvider(providerUrl, undefined, {
+      polling: true,
+      pollingInterval: 12000, // Poll every 12 seconds for mainnet (more conservative)
+      staticNetwork: true,    // Network won't change
+      batchStallTime: 250,    // Gather requests for longer
+      batchMaxSize: 3,        // Smaller batch size for mainnet to avoid rate limits
+      cacheTimeout: 30000     // Cache responses for 30 seconds to reduce duplicate requests
+    });
+
+    this.watchedWallets = new Map(); // Map of address -> donation settings
+    this.transactionQueue = [];
+    this.isProcessing = false;
+    this.lastProcessedBlock = 0;
+    
+    // Track processed transactions to avoid duplicates
+    this.processedTransactions = new Set();
+    
+    // Maximum number of transactions to keep in the set (to prevent memory leaks)
+    this.maxTrackedTransactions = 5000;
+  }
+
+  // Initialize the watcher service
+  async init() {
+    try {
+      console.log('Initializing blockchain watcher...');
+      
+      // Get the LATEST block number from the chain
+      const latestBlockNumber = await this.provider.getBlockNumber();
+      console.log(`Current chain head is at block ${latestBlockNumber}`);
+      
+      // Try to determine the best starting block based on database records
+      let startingBlock;
+      
+      try {
+        // Check for most recent transaction record
+        const latestTransaction = await TransactionRecord.findOne().sort({ processedAt: -1 }).lean();
+        
+        // Check for most recent watched wallet (when a season started)
+        const latestWallet = await ExistingWallet.findOne({ active: true }).sort({ timestamp: -1 }).lean();
+        
+        if (latestTransaction || latestWallet) {
+          console.log('Found existing database records to determine starting block...');
+          
+          let latestTimestamp = 0;
+          
+          // Find the most recent timestamp between transactions and wallet data
+          if (latestTransaction && latestTransaction.processedAt) {
+            latestTimestamp = Math.max(latestTimestamp, latestTransaction.processedAt);
+            console.log(`Latest transaction record timestamp: ${new Date(latestTimestamp * 1000).toISOString()}`);
+          }
+          
+          if (latestWallet && latestWallet.timestamp) {
+            // Convert milliseconds to seconds if the timestamp appears to be in milliseconds
+            const walletTimestamp = latestWallet.timestamp > 10000000000 ? 
+              Math.floor(latestWallet.timestamp / 1000) : latestWallet.timestamp;
+            
+            latestTimestamp = Math.max(latestTimestamp, walletTimestamp);
+            console.log(`Latest wallet record timestamp: ${new Date(latestTimestamp * 1000).toISOString()}`);
+          }
+          
+          if (latestTimestamp > 0) {
+            // Try to find a block from around this timestamp
+            // Subtract a small buffer to be safe
+            const safetyBufferSeconds = 3600; // 1 hour buffer
+            const targetTimestamp = Math.max(0, latestTimestamp - safetyBufferSeconds);
+            
+            // Use binary search to find the appropriate block
+            let lowerBound = Math.max(0, latestBlockNumber - 100000); // Default lower bound
+            let upperBound = latestBlockNumber;
+            
+            // Just do a coarse estimation rather than precise binary search to avoid too many RPC calls
+            // Assume average block time of 2 seconds on Base
+            const estimatedBlocksBack = Math.floor((Date.now()/1000 - targetTimestamp) / 2);
+            startingBlock = Math.max(0, latestBlockNumber - estimatedBlocksBack);
+            
+            console.log(`Estimated starting block ${startingBlock} based on timestamp ${new Date(targetTimestamp * 1000).toISOString()}`);
+          }
+        }
+      } catch (dbError) {
+        console.warn(`Error querying database for starting block, falling back to default: ${dbError.message}`);
+      }
+      
+      // If we don't have a valid starting block from DB records, use environment or default
+      if (!startingBlock || isNaN(startingBlock) || startingBlock < 0) {
+        if (process.env.START_BLOCK_NUMBER) {
+          // If a specific block number is provided in .env, use that
+          startingBlock = parseInt(process.env.START_BLOCK_NUMBER);
+          console.log(`Using specified starting block ${startingBlock} from environment`);
+        } else {
+          // Otherwise, use a default offset from latest block
+          const defaultBlockOffset = 100; 
+          startingBlock = Math.max(0, latestBlockNumber - defaultBlockOffset);
+          console.log(`Using default starting point ${startingBlock} (${latestBlockNumber - startingBlock} blocks behind head)`);
+        }
+      }
+      
+      // Ensure we never go back too far to avoid excessive processing
+      const maxBlocksBack = 10000;
+      const minimumAllowedBlock = Math.max(0, latestBlockNumber - maxBlocksBack);
+      this.lastProcessedBlock = Math.max(startingBlock, minimumAllowedBlock);
+      
+      console.log(`Starting to watch from block ${this.lastProcessedBlock} (${latestBlockNumber - this.lastProcessedBlock} blocks behind head)`);  
+        
+      // Load initial set of wallets from database
+      await this.refreshWatchedWallets();
+      
+      // EXPLICITLY LOG WHICH WALLETS WE ARE WATCHING
+      const watchedWallets = Array.from(this.watchedWallets.keys());
+      console.log('\n🔍 EXPLICITLY WATCHING THESE WALLETS:');
+      watchedWallets.forEach((wallet, i) => {
+        console.log(`  ${i+1}. ${wallet}`);
+      });
+      console.log(''); // Empty line for readability
+      
+      // Set up transaction processing loop
+      this.startProcessingLoop();
+      
+      // Set up wallet refresh loop
+      this.startWalletRefreshLoop();
+      
+      // Set up blockchain monitoring for ETH transfers
+      this.startBlockchainMonitoring();
+      
+      // Set up monitoring for ERC20 token transfers
+      this.setupERC20Monitoring();
+      
+      // Set up periodic check for new season records
+      this.startSeasonRecordsMonitoring();
+      
+      // IMMEDIATELY PROCESS ALL MISSED BLOCKS
+      console.log(`\n⚠️ CATCH-UP PROCESSING: Scanning ${latestBlockNumber - this.lastProcessedBlock} blocks for missed transactions...`);
+      await this.catchUpMissedBlocks();
+      
+      console.log('Blockchain watcher initialized successfully');
+    } catch (error) {
+      console.error('Error initializing blockchain watcher:', error);
+      throw error;
+    }
+  }
+
+  // Load/refresh wallets from MongoDB
+  async refreshWatchedWallets() {
+    try {
+      console.log('Refreshing watched wallets from database...');
+      
+      // Get all active wallet configurations from the database
+      // Sort by timestamp in descending order to get the most recent records first
+      const walletConfigs = await ExistingWallet.find({
+        active: true,
+        walletAddress: { $exists: true },
+        target: { $exists: true },
+        percentAmount: { $exists: true },
+      }).sort({ timestamp: -1 });
+      
+      console.log(`Found ${walletConfigs.length} wallet configurations`);
+      
+      // A set to track which wallets we've already processed
+      // We only want the most recent configuration for each wallet
+      const processedWallets = new Set();
+      
+      // Clear the current map
+      this.watchedWallets.clear();
+      
+      // Process each wallet configuration
+      for (const config of walletConfigs) {
+        // Skip if no wallet address or not properly configured
+        if (!config.walletAddress || !config.target || !config.percentAmount) {
+          console.log(`Skipping invalid config: ${config._id} - missing required fields`);
+          continue;
+        }
+        
+        // CRITICAL: Normalize the wallet address - ALWAYS use lowercase for consistency
+        // This fixes issues with address comparison
+        let walletAddress = config.walletAddress;
+        
+        // Ensure the address is properly formatted
+        if (!walletAddress.startsWith('0x')) {
+          walletAddress = '0x' + walletAddress;
+          console.log(`Adding 0x prefix to wallet address: ${walletAddress}`);
+        }
+        
+        // Always convert to lowercase for consistency
+        walletAddress = walletAddress.toLowerCase();
+        
+        // Skip if we've already processed this wallet
+        if (processedWallets.has(walletAddress)) {
+          console.log(`Skipping duplicate config for wallet: ${walletAddress}`);
+          continue;
+        }
+        
+        // Mark this wallet as processed
+        processedWallets.add(walletAddress);
+        
+        // Create a single configuration for this wallet
+        const walletConfig = {
+          id: config._id,
+          target: config.target.toLowerCase(), // Normalize target address too
+          percentAmount: config.percentAmount,
+          authorized: config.authorized ? config.authorized.toLowerCase() : null, // Normalize authorized address
+          network: config.network || 'base-sepolia', // Default to base-sepolia if not specified
+          lastDonation: config.lastDonation || 0,
+          timestamp: config.timestamp // Keep track of when this config was created
+        };
+        
+        // Add to our watched wallets map with a single configuration
+        this.watchedWallets.set(walletAddress, {
+          walletAddress: walletAddress,
+          configurations: [walletConfig] // Only use the most recent config
+        });
+        
+        console.log(`Now watching wallet ${walletAddress} with configuration from ${config.timestamp}`);
+        console.log(`   Donation: ${walletConfig.percentAmount}% to ${walletConfig.target}`);
+      }
+      
+      console.log(`Now watching ${this.watchedWallets.size} unique wallet(s)`);
+      
+      // Debug log to confirm which wallets are being watched
+      console.log('\n🔍 EXPLICITLY WATCHING THESE WALLETS:');
+      let index = 1;
+      for (const walletAddress of this.watchedWallets.keys()) {
+        console.log(`  ${index++}. ${walletAddress}`);
+      }
+      console.log(''); // Empty line for readability
+    } catch (error) {
+      console.error('Error refreshing watched wallets:', error);
+    }
+  }
+  
+  // Set up ERC20 transfer event monitoring
+  setupERC20Monitoring() {
+    console.log('Setting up ERC20 token transfer monitoring...');
+    
+    // The standard ERC20 Transfer event ABI
+    const transferEventAbi = [
+      'event Transfer(address indexed from, address indexed to, uint256 value)'
+    ];
+    
+    // Common ERC20 tokens to monitor (add more as needed)
+    const tokenAddresses = [
+      process.env.USDC_CONTRACT_ADDRESS.toLowerCase(), // USDC
+      '0x4200000000000000000000000000000000000006' // WETH on Base
+    ];
+    
+    // Create an interface for decoding ERC20 Transfer events
+    this.erc20Interface = new ethers.Interface(transferEventAbi);
+    
+    // Store token addresses for reference
+    this.monitoredTokens = new Set(tokenAddresses);
+    
+    // Cache for token details to reduce RPC calls
+    this.tokenMetadataCache = new Map();
+    
+    // Log information about what we're monitoring
+    tokenAddresses.forEach(tokenAddress => {
+      console.log(`Setting up monitoring for token at ${tokenAddress}`);
+    });
+    
+    // Log watched wallets that will be monitored for token transfers
+    const watchedWallets = Array.from(this.watchedWallets.keys());
+    console.log(`Monitoring ${watchedWallets.length} wallets for ERC20 token transfers`);
+    
+    console.log('ERC20 token transfer monitoring set up successfully');
+  }
+
+  // Start monitoring the blockchain for new blocks
+  startBlockchainMonitoring() {
+    console.log('Starting blockchain monitoring...');
+    
+    // Listen for new blocks
+    this.provider.on('block', async (blockNumber) => {
+      try {
+        // Don't process the same block twice
+        if (blockNumber <= this.lastProcessedBlock) {
+          return;
+        }
+        
+        console.log(`Processing new block: ${blockNumber}`);
+        await this.processBlock(blockNumber);
+      } catch (error) {
+        console.error(`Error processing block ${blockNumber}:`, error);
+      }
+    });
+    
+    // Set up a polling strategy as a backup
+    this.setupBlockPolling();
+    
+    console.log('Blockchain monitoring started');
+  }
+  
+  // Set up a polling strategy to check for new blocks periodically
+  // This is our PRIMARY mechanism for reliable block processing
+  setupBlockPolling() {
+    console.log('Setting up aggressive block polling for maximum reliability');
+    
+    // Check for new blocks FREQUENTLY - every 5 seconds
+    setInterval(async () => {
+      try {
+        // Get the latest block number from the chain
+        const latestBlock = await this.provider.getBlockNumber();
+        
+        // If we've missed some blocks, process them
+        if (latestBlock > this.lastProcessedBlock) {
+          console.log(`⛓️ Processing ${latestBlock - this.lastProcessedBlock} new blocks... (${this.lastProcessedBlock + 1} to ${latestBlock})`);
+          
+          // Process ALL missed blocks, not just a limited number
+          // This is critical to ensure we don't miss any transactions
+          const startBlock = this.lastProcessedBlock + 1;
+          const endBlock = latestBlock;
+          
+          for (let blockNumber = startBlock; blockNumber <= endBlock; blockNumber++) {
+            await this.processBlock(blockNumber);
+            await this.saveState();
+          }
+          
+          console.log(`✅ Caught up: Processed all blocks up to ${latestBlock}`);
+        }
+      } catch (error) {
+        console.error('Error in block polling:', error);
+      }
+    }, 5 * 1000); // Check every 5 seconds
+  }
+  
+  async saveState() {
+    try {
+      console.log(`Saving state: Last processed block = ${this.lastProcessedBlock}`);
+      console.log(`Total tracked transactions: ${this.processedTransactions.size}`);
+      // State saving logic goes here
+    } catch (error) {
+      console.error('Error saving state:', error);
+    }
+  }
+
+  // Process a specific block
+  async processBlock(blockNumber) {
+    try {
+      // Don't process the same block twice
+      if (blockNumber <= this.lastProcessedBlock) return;
+      
+      // Update for next time
+      this.lastProcessedBlock = blockNumber;
+      
+      // Simple log showing which block we're checking
+      console.log(`⛓️ Checking block #${blockNumber}...`);
+      
+      // Get the block with full transaction details
+      const block = await this.provider.getBlock(blockNumber, true);
+      if (!block || !block.transactions) {
+        return; // No transactions, just skip silently
+      }
+      
+      // Store block timestamp for use with transactions
+      const blockTimestamp = block.timestamp;
+      
+      // Only log if there are actually transactions
+      if (block.transactions.length > 0) {
+        console.log(`   Found ${block.transactions.length} transactions in block #${blockNumber}`);
+      }
+      
+      // Process each transaction in the block
+      let watchedWalletTransactions = 0;
+      let relevantTransactionCount = 0;
+      
+      // The standard ERC20 Transfer event signature
+      const transferEventTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      
+      // In ethers.js, block.transactions can sometimes be just an array of transaction hashes
+      // rather than full transaction objects, so we need to handle both cases
+      
+      // Group transactions into smaller batches to avoid rate limiting
+      // Use a smaller batch size for mainnet
+      const txBatchSize = 3;
+      for (let i = 0; i < block.transactions.length; i++) {
+        // Add a longer delay every few transactions to avoid rate limiting on mainnet
+        if (i > 0 && i % txBatchSize === 0) {
+          await this.delay(600); // 600ms pause every few transactions on mainnet
+        }
+        
+        // Get the transaction hash or object
+        const txHashOrObj = block.transactions[i];
+        let txHash, txDetails;
+        
+        // Check if we received a hash or an object
+        if (typeof txHashOrObj === 'string') {
+          // We have a transaction hash, need to fetch the full details
+          txHash = txHashOrObj;
+          try {
+            // Add retry logic for transaction fetching
+            let retries = 0;
+            const maxRetries = 3;
+            
+            while (retries < maxRetries) {
+              try {
+                txDetails = await this.provider.getTransaction(txHash);
+                if (!txDetails) {
+                  console.log(`   Could not fetch details for transaction ${txHash}`);
+                  retries++;
+                  if (retries < maxRetries) {
+                    await this.delay(500 * retries); // Exponential backoff
+                    continue;
+                  }
+                  break;
+                }
+                break; // Success, exit the retry loop
+              } catch (fetchError) {
+                // If we hit a rate limit, wait and retry
+                if (fetchError.message.includes('rate limit') || 
+                    fetchError.message.includes('429')) {
+                  retries++;
+                  if (retries < maxRetries) {
+                    console.log(`   Rate limited, retrying in ${500 * retries}ms...`);
+                    await this.delay(500 * retries); // Exponential backoff
+                    continue;
+                  }
+                }
+                throw fetchError; // Rethrow if it's not a rate limit error or we've exhausted retries
+              }
+            }
+            
+            if (!txDetails) {
+              continue; // Skip this transaction if we still can't get details
+            }
+          } catch (error) {
+            console.error(`   Error fetching transaction ${txHash}:`, error.message);
+            continue; // Skip this transaction if there's an error
+          }
+        } else {
+          // We already have a transaction object
+          txDetails = txHashOrObj;
+          txHash = txDetails.hash;
+          
+          // Add block timestamp to transaction details
+          txDetails.blockTimestamp = blockTimestamp;
+        }
+        
+        if (!txDetails || !txHash) {
+          console.log(`   Transaction #${i + 1}: Invalid transaction data`);
+          continue;
+        }
+        
+        // Now we can safely access properties like .to and .from
+        const recipient = txDetails.to ? txDetails.to.toLowerCase() : null;
+        
+        // Check if this transaction involves any of our watched wallets
+        const isRelevant = recipient && this.watchedWallets.has(recipient);
+        
+        if (isRelevant) {
+          relevantTransactionCount++;
+          watchedWalletTransactions++;
+          
+          // Log only essential information for watched wallet transactions
+          console.log(`   💰 Transaction: ${txHash.substring(0, 10)}...${txHash.substring(txHash.length - 8)}`);
+          console.log(`      From: ${txDetails.from ? txDetails.from.substring(0, 10) + '...' : 'unknown'}`);
+          console.log(`      To:   ${recipient ? recipient.substring(0, 10) + '...' : 'unknown'} (Watched Wallet)`);
+          console.log(`      Value: ${txDetails.value ? ethers.formatEther(txDetails.value) + ' ETH' : '0 ETH'}`);
+          
+          // Don't log anything for non-relevant transactions
+        }
+        
+        // Process the transaction if it's relevant
+        if (isRelevant) {
+          // Pass the block timestamp to the transaction processing
+          await this.checkTransaction(txDetails, blockTimestamp);
+        }
+        
+        // Now check for ERC20 token transfers by examining the transaction receipt
+        try {
+          // Get the transaction receipt to check the logs for ERC20 transfers
+          const receipt = await this.provider.getTransactionReceipt(txHash);
+          
+          if (receipt && receipt.logs && receipt.logs.length > 0) {
+            // Look through all logs for ERC20 Transfer events
+            for (const log of receipt.logs) {
+              try {
+                // Check if this is a Transfer event (topic 0 is the event signature)
+                if (log.topics[0] === transferEventTopic && log.topics.length === 3) {
+                  // Extract addresses (remove padding and leading zeros)
+                  const from = '0x' + log.topics[1].substring(26);
+                  const to = '0x' + log.topics[2].substring(26);
+                  // Extract amount from data field
+                  const value = BigInt(log.data);
+                  
+                  // Only process if the recipient is a watched wallet
+                  if (this.watchedWallets.has(to.toLowerCase())) {
+                    console.log(`   🔍 Detected ERC20 Transfer in tx ${txHash.substring(0, 8)}...`);
+                    console.log(`      Token: ${log.address}`);
+                    console.log(`      From: ${from.substring(0, 10)}...`);
+                    console.log(`      To: ${to.substring(0, 10)}... (Watched Wallet)`);
+                    console.log(`      Value: ${value.toString()}`);
+                    
+                    // Process the ERC20 transfer
+                    await this.processERC20Transfer(log.address, from, to, value, txHash);
+                    
+                    // Increment our counter for watched wallet transactions
+                    watchedWalletTransactions++;
+                  }
+                }
+              } catch (logError) {
+                console.error(`Error processing log in transaction ${txHash}:`, logError);
+              }
+            }
+          }
+        } catch (receiptError) {
+          console.error(`Error getting receipt for transaction ${txHash}:`, receiptError);
+        }
+      }
+      
+      // Log watched wallet transactions if any were found
+      if (watchedWalletTransactions > 0) {
+        console.log(`   ✅ Found ${watchedWalletTransactions} transactions to watched wallets in block #${blockNumber}`);
+      }
+      
+      // Update the last processed block
+      this.lastProcessedBlock = blockNumber;
+    } catch (error) {
+      console.error(`Error processing block ${blockNumber}:`, error);
+    }
+  }
+
+  // Check a transaction to see if it involves a watched wallet
+  async checkTransaction(tx, blockTimestamp) {
+    // Skip if no recipient or no value
+    if (!tx.to || !tx.value) return;
+    
+    // Always normalize to lowercase for consistent comparison
+    const recipient = tx.to.toLowerCase();
+    const txHash = tx.hash ? tx.hash.toLowerCase() : null;
+    
+    // Use provided blockTimestamp or fall back to current time if not available
+    const timestamp = blockTimestamp || Math.floor(Date.now() / 1000);
+    
+    // IMPORTANT: Skip if we've already processed this transaction
+    if (this.processedTransactions.has(txHash)) {
+      // Already processed, just return silently
+      return;
+    }
+    
+    // Only thing that matters: Is the recipient a watched wallet?
+    const isWatchedWallet = this.watchedWallets.has(recipient);
+    
+    // Enhanced logging to help with debugging
+    if (tx.value.toString() !== '0') {
+      console.log(`Checking tx ${txHash.substring(0, 10)}... to ${recipient.substring(0, 10)}... (${ethers.formatEther(tx.value)} ETH)`);
+      console.log(`Is wallet watched? ${isWatchedWallet ? 'YES' : 'NO'}`);
+    }
+    
+    // Skip if it's not a watched wallet
+    if (!isWatchedWallet) return;
+    
+    // Mark this transaction as processed to avoid duplicate processing
+    this.processedTransactions.add(txHash);
+    
+    // Check if we've exceeded our transaction tracking limit
+    if (this.processedTransactions.size > this.maxTrackedTransactions) {
+      // Get first N items to remove (oldest transactions)
+      const itemsToRemove = Array.from(this.processedTransactions).slice(0, 1000);
+      itemsToRemove.forEach(item => this.processedTransactions.delete(item));
+      console.log(`Transaction tracking trimmed. Removed ${itemsToRemove.length} old transactions.`);
+    }
+    
+    // Log details for watched wallet transactions
+    console.log(`Detected funds received by watched wallet: ${recipient}`);
+    console.log('Transaction hash:', txHash);
+    console.log('Transaction data:', {
+      hash: txHash,
+      to: recipient,
+      from: tx.from ? tx.from.toLowerCase() : 'unknown',
+      value: tx.value ? tx.value.toString() : 'unknown'
+    });
+    
+    try {
+      // Get full transaction details with a proper .value property
+      let txDetails = tx;
+      
+      // If the transaction has a hash but is missing detailed data,
+      // fetch the full transaction data
+      if (txHash && (!tx.value || !tx.from)) {
+        txDetails = await this.provider.getTransaction(txHash);
+        if (!txDetails) {
+          console.error(`Could not get transaction details for ${txHash}`);
+          return;
+        }
+      }
+      
+      console.log('Full transaction details:', {
+        value: txDetails.value.toString(),
+        from: txDetails.from ? txDetails.from.toLowerCase() : 'unknown',
+        to: txDetails.to.toLowerCase()
+      });
+      
+      // Get transaction receipt to check if it was successful
+      const receipt = await this.provider.getTransactionReceipt(txHash);
+      
+      // Skip failed transactions
+      if (!receipt || receipt.status === 0) {
+        console.log(`Transaction ${txHash} failed or is still pending`);
+        return;
+      }
+      
+      console.log(`Transaction ${txHash} succeeded! Processing donation...`);
+      
+      // All we care about is that a watched wallet received funds
+      // Process the donation based on the wallet's configuration
+      await this.processValueTransfer(recipient, txDetails.value, txHash, 'ETH', timestamp);
+    } catch (error) {
+      console.error(`Error processing transaction ${txHash}:`, error);
+    }
+  }
+
+  // Process an ERC20 token transfer
+  async processERC20Transfer(tokenAddress, from, to, value, txHash) {
+    const recipient = to.toLowerCase();
+    txHash = txHash.toLowerCase();
+    
+    // IMPORTANT: Skip if we've already processed this transaction
+    if (this.processedTransactions.has(txHash)) {
+      // Already processed, just return silently
+      return;
+    }
+    
+    // Check if the recipient is one of our watched wallets
+    if (this.watchedWallets.has(recipient)) {
+      console.log(`Detected ERC20 transfer to watched wallet: ${recipient}`);
+      console.log(`Token: ${tokenAddress}, Amount: ${value.toString()}`);
+      
+      // Mark this transaction as processed to avoid duplicate processing
+      this.processedTransactions.add(txHash);
+      
+      try {
+        // Get token details (we need to know decimals for proper conversion)
+        const tokenDecimals = await this.getTokenDecimals(tokenAddress);
+        const tokenSymbol = await this.getTokenSymbol(tokenAddress);
+        
+        // For USDC-like tokens (6 decimals), we can use the value directly
+        // For other tokens, convert to a USD value
+        let usdcEquivalent;
+        
+        // Handle different tokens
+        if (tokenAddress.toLowerCase() === process.env.USDC_CONTRACT_ADDRESS.toLowerCase()) {
+          // It's already USDC, just use the value directly
+          usdcEquivalent = value;
+          // Safely format the USDC value using ethers.js formatUnits
+          console.log(`Received ${ethers.formatUnits(value, tokenDecimals)} USDC`);
+        } else if (tokenSymbol === 'WETH') {
+          // For WETH, unwrap to ETH value and then convert to USDC
+          // First adjust for decimal difference between WETH (18) and ETH (18)
+          const ethEquivalent = value;
+          usdcEquivalent = priceFeed.convertEthToUsdc(ethEquivalent);
+          // Safely format the values using ethers.js formatUnits
+          console.log(`Received ${ethers.formatUnits(value, tokenDecimals)} WETH = ${ethers.formatUnits(usdcEquivalent, 6)} USDC`);
+        } else {
+          // For other tokens, attempt to get a price but fallback to not processing if we can't
+          console.log(`Unsupported token transfer: ${tokenSymbol}. Skipping.`);
+          return;
+        }
+        
+        // Process the donation based on the wallet's configuration
+        // Pass the block timestamp from the current block we're processing
+        const timestamp = Math.floor(Date.now() / 1000); // Default to current time
+        await this.processValueTransfer(recipient, value, txHash, tokenSymbol, timestamp);
+      } catch (error) {
+        console.error(`Error processing ERC20 transfer: ${error.message}`);
+      }
+    }
+  }
+
+  // Get token decimals
+  async getTokenDecimals(tokenAddress) {
+    try {
+      const tokenContract = new ethers.Contract(
+        tokenAddress,
+        ['function decimals() view returns (uint8)'],
+        this.provider
+      );
+      return await tokenContract.decimals();
+    } catch (error) {
+      console.error(`Error getting token decimals: ${error.message}`);
+      return 18; // Default to 18 decimals (most ERC20 tokens)
+    }
+  }
+
+  // Get token symbol
+  async getTokenSymbol(tokenAddress) {
+    try {
+      const tokenContract = new ethers.Contract(
+        tokenAddress,
+        ['function symbol() view returns (string)'],
+        this.provider
+      );
+      return await tokenContract.symbol();
+    } catch (error) {
+      console.error(`Error getting token symbol: ${error.message}`);
+      return 'UNKNOWN';
+    }
+  }
+
+  // Process a value transfer (ETH or tokens) to a watched wallet
+  async processValueTransfer(recipient, valueAmount, txHash, assetType, blockTimestamp) {
+    // Get the transaction data to determine the original sender
+    let transactionData;
+    try {
+      transactionData = await this.provider.getTransaction(txHash);
+      if (!transactionData) {
+        console.error(`Could not get transaction data for ${txHash}`);
+        return;
+      }
+    } catch (error) {
+      console.error(`Error getting transaction data: ${error.message}`);
+      return;
+    }
+    
+    const walletData = this.watchedWallets.get(recipient);
+    
+    // Skip if this wallet is not configured correctly
+    if (!walletData || !walletData.configurations || walletData.configurations.length === 0) {
+      console.log(`Wallet ${recipient} has no valid configurations`);
+      return;
+    }
+    
+    // Process each configuration for this wallet
+    for (const config of walletData.configurations) {
+      // Skip if missing critical configuration
+      if (!config.target || !config.percentAmount) {
+        continue;
+      }
+      
+      const donationPercentage = config.percentAmount;
+      
+      // Skip invalid configurations
+      if (!donationPercentage || donationPercentage <= 0) {
+        console.log(`Skipping configuration with invalid percentage: ${donationPercentage}`);
+        continue;
+      }
+      
+      let usdcEquivalent, rawValue, usdcFormatted;
+      
+      if (assetType === 'ETH') {
+        // Convert ETH to USDC for donation calculation
+        usdcEquivalent = priceFeed.convertEthToUsdc(valueAmount);
+        rawValue = ethers.formatEther(valueAmount);
+        usdcFormatted = (Number(usdcEquivalent) / 1e6).toFixed(6);
+        console.log(`Transaction value: ${rawValue} ETH = ${usdcFormatted} USDC`);
+      } else if (assetType === 'USDC') {
+        // Already in USDC, use directly
+        usdcEquivalent = valueAmount;
+        rawValue = (valueAmount / BigInt(1e6)).toString();
+        usdcFormatted = Number(rawValue).toFixed(6);
+        console.log(`Transaction value: ${usdcFormatted} USDC`);
+      } else if (assetType === 'WETH') {
+        // Same as ETH in value
+        usdcEquivalent = priceFeed.convertEthToUsdc(valueAmount);
+        rawValue = ethers.formatEther(valueAmount);
+        usdcFormatted = (Number(usdcEquivalent) / 1e6).toFixed(6);
+        console.log(`Transaction value: ${rawValue} WETH = ${usdcFormatted} USDC`);
+      } else {
+        // Unsupported asset type
+        console.log(`Unsupported asset type: ${assetType}. Skipping.`);
+        continue;
+      }
+      
+      // Calculate donation amount in USDC based on percentage
+    // Use proper BigInt for calculations to prevent type errors
+    // USDC has 6 decimals
+    
+    // For Number-based calculation, we convert BigInt to Number first
+    const usdcValue = Number(ethers.formatUnits(usdcEquivalent, 6));
+    
+    // Calculate donation amount both ways for precise measurement
+    const donationAmountFloat = usdcValue * (donationPercentage / 100);
+    const donationAmount = (usdcEquivalent * BigInt(donationPercentage)) / BigInt(100);
+      
+      console.log(`Calculated donation amount: ${ethers.formatUnits(donationAmount, 6)} USDC (${donationPercentage}%)`);
+      console.log(`Float calculation: ${donationAmountFloat.toFixed(6)} USDC`);
+      
+      // NEVER skip donation - use the smallest possible USDC unit if needed
+      // For very small donations, use float calculation and ensure at least 1 unit of USDC (0.000001)
+      const SMALLEST_USDC_UNIT = 1n; // 1 unit = 0.000001 USDC (smallest possible unit)
+      
+      let finalDonationAmount;
+      if (donationAmount > 0) {
+        // If BigInt calculation gives non-zero value, use it
+        finalDonationAmount = donationAmount;
+      } else if (donationAmountFloat > 0) {
+        // If percentage is non-zero but BigInt calculation gives zero,
+        // use float calculation but ensure at least 1 unit of USDC
+        const floatBasedAmount = BigInt(Math.floor(donationAmountFloat * 1e6));
+        finalDonationAmount = floatBasedAmount > 0 ? floatBasedAmount : SMALLEST_USDC_UNIT;
+        console.log(`⚠️ Rounding tiny donation up to smallest USDC unit (0.000001 USDC)`);
+      } else {
+        // If percentage is zero, no donation
+        finalDonationAmount = 0n;
+      }
+      
+      if (finalDonationAmount > 0) {
+        // Now queue the donation for processing
+        this.queueDonation({
+          from: recipient,                          // Watched wallet (sending the donation)
+          originalFrom: transactionData.from,        // Original transaction sender
+          originalTo: recipient,                    // Original transaction recipient (watched wallet)
+          txHash: txHash,
+          assetType: assetType,
+          originalValue: valueAmount.toString(),
+          usdcEquivalent: usdcEquivalent.toString(), // Store original USDC equivalent
+          usdcFormatted: usdcFormatted,             // Store formatted USDC value
+          to: config.target,                        // The donation recipient address from the config
+          authorized: config.authorized,             // The contract authorized to spend tokens
+          configId: config.id,                       // Config ID to update records later
+          donationAmount: finalDonationAmount.toString(),
+          percentAmount: donationPercentage,
+          timestamp: blockTimestamp || Math.floor(Date.now() / 1000)  // Use block timestamp
+        });
+        
+        console.log(`Queued donation of ${finalDonationAmount / BigInt(1e6)} USDC (${donationPercentage}%) to ${config.target}`);
+      } else {
+        console.log(`⚠️ Final donation amount is still zero. Transaction too small to generate a meaningful donation.`);
+      }
+    }
+  }
+
+  // Queue a donation for processing
+  queueDonation(donationData) {
+    this.transactionQueue.push(donationData);
+    
+    // Start processing the queue if not already processing
+    if (!this.isProcessing) {
+      this.processTransactionQueue();
+    }
+  }
+
+  // Process the transaction queue
+  async processTransactionQueue() {
+    // Skip if already processing or queue is empty
+    if (this.isProcessing || this.transactionQueue.length === 0) {
+      return;
+    }
+    
+    try {
+      this.isProcessing = true;
+      
+      // Get the next donation from the queue
+      const donation = this.transactionQueue.shift();
+      
+      // Skip if donation is null or missing txHash (shouldn't happen but be safe)
+      if (!donation || !donation.txHash) {
+        console.log(`Skipping invalid donation in queue`);
+        return;
+      }
+      
+      console.log(`Processing donation for transaction ${donation.txHash}...`);
+      console.log(`Donation details: ${donation.from} -> ${donation.to}, Amount: ${donation.donationAmount} USDC`);
+      
+      // Calculate the original transaction USDC value
+      // Original value is donationAmount * 100 / percentAmount
+      const originalUsdcValue = donation.percentAmount > 0 ?
+        (BigInt(donation.donationAmount) * BigInt(100) / BigInt(donation.percentAmount)).toString() :
+        '0';
+      
+      // Create a transaction record - initially marked as pending
+      const transactionRecord = new TransactionRecord({
+        txHash: donation.txHash,
+        originalTransaction: {
+          from: donation.originalFrom,           // Sender of the original transaction
+          to: donation.originalTo,              // Recipient of the original transaction (watched wallet)
+          value: donation.originalValue,        // Original transaction value
+          assetType: donation.assetType,        // Asset type (ETH, USDC, WETH)
+          usdcValue: originalUsdcValue          // USDC equivalent in smallest unit
+        },
+        donation: {
+          from: donation.from,                  // Donation sender (watched wallet)
+          to: donation.to,                      // Donation recipient 
+          amount: donation.donationAmount,      // USDC amount in smallest unit
+          usdcValue: donation.donationAmount,   // USDC value in base units (smallest unit)
+          percentAmount: donation.percentAmount,
+          contractAddress: donation.authorized || process.env.EON_CONTRACT_ADDRESS
+        },
+        blockTimestamp: donation.timestamp,
+        processedAt: Math.floor(Date.now() / 1000),
+        configId: donation.configId,
+        status: 'pending'
+      });
+      
+      try {
+        // First save the pending record
+        await transactionRecord.save();
+        console.log(`Created transaction record in database for ${donation.txHash}`);
+        
+        // Prepare donation data in the format expected by the blockchain service
+        // The blockchain service expects arrays for batch processing
+        const donationData = {
+          froms: [donation.from.toLowerCase()],
+          tos: [donation.to.toLowerCase()],
+          donationTimes: [donation.timestamp],
+          usdcAmounts: [donation.donationAmount],
+          contractAddress: donation.authorized || process.env.EON_CONTRACT_ADDRESS
+        };
+        
+        // Process the donation using the correct method (processDonations, not processDonation)
+        const result = await blockchainService.processDonations(donationData);
+        
+        if (result.success) {
+          console.log(`Successfully processed donation for transaction ${donation.txHash}`);
+          console.log(`Transaction hash: ${result.transactionHash}`);
+          
+          // Update the transaction record with success status and transaction hash
+          await TransactionRecord.findOneAndUpdate(
+            { txHash: donation.txHash },
+            {
+              status: 'success',
+              'donation.donationTxHash': result.transactionHash
+            }
+          );
+          
+          // Update the wallet configuration with the last donation timestamp
+          const walletData = this.watchedWallets.get(donation.from.toLowerCase());
+          if (walletData) {
+            for (const config of walletData.configurations) {
+              if (config.id.toString() === donation.configId.toString()) {
+                config.lastDonation = donation.timestamp;
+                
+                // Also update in database
+                await ExistingWallet.findByIdAndUpdate(config.id, {
+                  lastDonation: donation.timestamp
+                });
+                
+                console.log(`Updated last donation timestamp for wallet ${donation.from} to ${new Date(donation.timestamp * 1000).toISOString()}`);
+                break;
+              }
+            }
+          }
+        } else {
+          // Update the transaction record with failure status
+          await TransactionRecord.findOneAndUpdate(
+            { txHash: donation.txHash },
+            {
+              status: 'failed',
+              error: result.message || 'Unknown error'
+            }
+          );
+          console.error(`Failed to process donation: ${result.message}`);
+        }
+      } catch (error) {
+        // Update the transaction record with failure status
+        await TransactionRecord.findOneAndUpdate(
+          { txHash: donation.txHash },
+          {
+            status: 'failed',
+            error: error.message || 'Unknown error'
+          }
+        ).catch(err => console.error('Error updating transaction record:', err));
+        
+        console.error(`Error processing donation: ${error.message}`);
+      }
+    } finally {
+      this.isProcessing = false;
+      
+      // Continue processing the queue if there are more items
+      if (this.transactionQueue.length > 0) {
+        await this.processTransactionQueue();
+      }
+    }
+  }
+
+  // Helper method to add a delay between operations
+  async delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+  
+  // Check season_records collection every 30 seconds for any new records
+  startSeasonRecordsMonitoring() {
+    const INTERVAL_MS = 30 * 1000; // 30 seconds
+    console.log(`Setting up season_records monitoring every ${INTERVAL_MS/1000} seconds`);
+    
+    // Store the latest timestamp we've seen to only process new records
+    let latestProcessedTimestamp = 0;
+    
+    // Initial check to set the baseline timestamp
+    ExistingWallet.findOne({active: true})
+      .sort({timestamp: -1})
+      .lean()
+      .then(record => {
+        if (record && record.timestamp) {
+          // Convert timestamp to seconds if it appears to be in milliseconds
+          latestProcessedTimestamp = record.timestamp > 10000000000 ? 
+            Math.floor(record.timestamp / 1000) : record.timestamp;
+          console.log(`Initial latest season record timestamp: ${new Date(latestProcessedTimestamp * 1000).toISOString()}`);
+        }
+      })
+      .catch(err => console.error('Error getting initial timestamp:', err));
+    
+    // Set up the interval to check for new records
+    setInterval(async () => {
+      try {
+        console.log('Checking for new season records...');
+        
+        // Find any records newer than our latest processed timestamp
+        const newRecords = await ExistingWallet.find({
+          active: true,
+          walletAddress: { $exists: true },
+          target: { $exists: true },
+          percentAmount: { $exists: true },
+          timestamp: { $gt: latestProcessedTimestamp }
+        }).sort({ timestamp: 1 }); // Process oldest first
+        
+        if (newRecords.length > 0) {
+          console.log(`Found ${newRecords.length} new season records`);
+          
+          // Process each new record and update our watched wallets map
+          for (const record of newRecords) {
+            if (!record.walletAddress) continue;
+            
+            // Normalize wallet address
+            let walletAddress = record.walletAddress;
+            if (!walletAddress.startsWith('0x')) {
+              walletAddress = '0x' + walletAddress;
+            }
+            walletAddress = walletAddress.toLowerCase();
+            
+            // Create wallet configuration
+            const walletConfig = {
+              id: record._id,
+              target: record.target.toLowerCase(),
+              percentAmount: record.percentAmount,
+              authorized: record.authorized ? record.authorized.toLowerCase() : null,
+              network: record.network || 'base',
+              lastDonation: record.lastDonation || 0,
+              timestamp: record.timestamp
+            };
+            
+            // Check if we're already tracking this wallet
+            if (this.watchedWallets.has(walletAddress)) {
+              // Update existing record with the new configuration
+              const existingConfig = this.watchedWallets.get(walletAddress);
+              existingConfig.configurations = [walletConfig]; // Replace with most recent config
+              console.log(`Updated configuration for wallet ${walletAddress} from ${new Date(record.timestamp * 1000).toISOString()}`);
+            } else {
+              // Add new wallet configuration
+              this.watchedWallets.set(walletAddress, {
+                walletAddress: walletAddress,
+                configurations: [walletConfig]
+              });
+              console.log(`Added new watched wallet ${walletAddress} with configuration from ${new Date(record.timestamp * 1000).toISOString()}`);
+            }
+            
+            // Update latest timestamp if this record is newer
+            const recordTimestamp = record.timestamp > 10000000000 ? 
+              Math.floor(record.timestamp / 1000) : record.timestamp;
+            
+            if (recordTimestamp > latestProcessedTimestamp) {
+              latestProcessedTimestamp = recordTimestamp;
+            }
+          }
+          
+          // Log the updated wallet list
+          console.log(`Now watching ${this.watchedWallets.size} unique wallet(s)`);
+          console.log('\n🔍 UPDATED WATCHED WALLETS LIST:');
+          let index = 1;
+          for (const walletAddress of this.watchedWallets.keys()) {
+            console.log(`  ${index++}. ${walletAddress}`);
+          }
+          console.log(''); // Empty line for readability
+        } else {
+          console.log('No new season records found');
+        }
+      } catch (error) {
+        console.error('Error checking for new season records:', error);
+      }
+    }, INTERVAL_MS);
+    
+    console.log('Season records monitoring started successfully');
+  }
+
+  // Catch up on any missed blocks since the last processed block
+  async catchUpMissedBlocks() {
+    try {
+      // Get the latest block number
+      const latestBlock = await this.provider.getBlockNumber();
+      
+      // If we're already caught up, just return
+      if (this.lastProcessedBlock >= latestBlock) {
+        console.log('Already caught up with the latest block');
+        return;
+      }
+      
+      // Process all blocks from lastProcessedBlock+1 to latestBlock
+      const startBlock = this.lastProcessedBlock + 1;
+      const endBlock = latestBlock;
+      const totalBlocks = endBlock - startBlock + 1;
+      
+      console.log(`Catching up on ${totalBlocks} missed blocks (${startBlock} to ${endBlock})...`);
+      
+      // Process blocks in smaller batches with delays between batches to avoid rate limiting
+      // This is especially important for ERC20 token detection which requires additional RPC calls
+      // For mainnet, use even smaller batch sizes and longer delays
+      const batchSize = 3; // Smaller batch size for mainnet
+      for (let i = startBlock; i <= endBlock; i += batchSize) {
+        const batchEnd = Math.min(i + batchSize - 1, endBlock);
+        console.log(`⛓️ Processing blocks ${i} to ${batchEnd}...`);
+        
+        // Process each block in the batch sequentially with a delay between blocks
+        for (let blockNumber = i; blockNumber <= batchEnd; blockNumber++) {
+          await this.processBlock(blockNumber);
+          // Add a longer delay between processing blocks for mainnet
+          if (blockNumber < batchEnd) {
+            await this.delay(500); // 500ms delay between blocks for mainnet
+          }
+        }
+        
+        // Add a longer delay between batches to avoid rate limiting
+        if (i + batchSize <= endBlock) {
+          console.log(`Pausing for rate limiting before next batch...`);
+          await this.delay(2500); // 2.5 second delay between batches for mainnet
+        }
+      }
+      
+      console.log(`Catch-up complete! Processed all blocks up to ${endBlock}`);
+    } catch (error) {
+      console.error('Error catching up on missed blocks:', error);
+    }
+  }
+  
+  // For debugging: check a specific transaction
+  async checkSpecificTransaction(txHash) {
+    if (!txHash) return;
+    
+    console.log(`Checking specific transaction: ${txHash}`);
+    
+    try {
+      // Get transaction details
+      const tx = await this.provider.getTransaction(txHash);
+      if (!tx) {
+        console.log(`Transaction not found: ${txHash}`);
+        return;
+      }
+      
+      console.log('Transaction found:', tx);
+      
+      // Process it
+      await this.checkTransaction(tx);
+      
+      // Check for ERC20 transfers
+      const receipt = await this.provider.getTransactionReceipt(txHash);
+      if (receipt && receipt.logs) {
+        // ERC20 Transfer event signature
+        const transferEventTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+        
+        for (const log of receipt.logs) {
+          try {
+            // Check if this is a Transfer event (topic 0 is the event signature)
+            if (log.topics[0] === transferEventTopic && log.topics.length === 3) {
+              // Extract addresses (remove padding and leading zeros)
+              const from = '0x' + log.topics[1].substring(26);
+              const to = '0x' + log.topics[2].substring(26);
+              
+              // Extract amount from data field
+              const value = BigInt(log.data);
+              
+              console.log(`Detected Transfer event in transaction ${txHash}:`);
+              console.log(`Token: ${log.address}`);
+              console.log(`From: ${from}`);
+              console.log(`To: ${to}`);
+              console.log(`Value: ${value.toString()}`);
+              
+              // Process it as an ERC20 transfer
+              await this.processERC20Transfer(log.address, from, to, value, txHash);
+            }
+          } catch (error) {
+            console.error(`Error processing log in transaction ${txHash}:`, error);
+          }
+        }
+      }
+    } catch (error) {
+      console.error(`Error checking transaction ${txHash}:`, error);
+    }
+  }
+}
+
+module.exports = new BlockchainWatcher();
