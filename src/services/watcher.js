@@ -4,7 +4,6 @@ const ExistingWallet = require('../models/ExistingWallet');
 const TransactionRecord = require('../models/TransactionRecord');
 const blockchainService = require('./blockchain');
 const priceFeed = require('./priceFeed');
-const seasonGoalService = require('./seasonGoals');
 require('dotenv').config();
 
 class BlockchainWatcher {
@@ -200,8 +199,8 @@ class BlockchainWatcher {
 
   // Start a loop to periodically refresh the wallet list
   startWalletRefreshLoop() {
-    // Refresh the wallet list every 5 minutes
-    setInterval(() => this.refreshWatchedWallets(), 5 * 60 * 1000);
+    // Refresh the wallet list every 5 seconds
+    setInterval(() => this.refreshWatchedWallets(), 5 * 1000);
   }
 
   // Start a loop to process the transaction queue
@@ -359,7 +358,7 @@ class BlockchainWatcher {
         return;
       }
       
-      // Only log transactions relevant to watched wallets
+      console.log(`\n⚡ WEBSOCKET NOTIFICATION: Received transaction ${txHash}`);
       
       // Skip if we've already processed this transaction
       if (this.processedTransactions.has(txHash)) {
@@ -383,12 +382,16 @@ class BlockchainWatcher {
       }
       
       // Log transaction details
-      // Only log transactions for watched wallets
+      console.log(`Processing transaction: ${txHash.substring(0, 10)}...`);
+      console.log(`Transaction details:`);
+      console.log(` - From: ${tx.from || 'unknown'}`);
+      console.log(` - To: ${tx.to || 'unknown'}`);
+      console.log(` - Value: ${tx.value ? ethers.formatEther(tx.value) : '0'} ETH`);
       
       // First, check if this is a direct ETH transfer to a watched wallet
       const to = tx.to ? tx.to.toLowerCase() : null;
       if (to && this.watchedWallets.has(to)) {
-        console.log(`\n🎯 Detected ETH transfer to watched wallet ${to}`);
+        console.log(`✅ DIRECT MATCH: ETH transfer to watched wallet ${to}`);
         // Process ETH transfer
         const timestamp = Math.floor(Date.now() / 1000);
         await this.checkTransaction(tx, timestamp);
@@ -446,10 +449,9 @@ class BlockchainWatcher {
       const usdcAddress = process.env.USDC_CONTRACT_ADDRESS.toLowerCase();
       const wethAddress = '0x4200000000000000000000000000000000000006'.toLowerCase();
 
-      // Token type already defined above
-            if (tokenAddress === usdcAddress) {
-              // Maintain the value for compatibility
-              tokenType = 'USDC';
+      let tokenType;
+      if (tokenAddress === usdcAddress) {
+        tokenType = 'USDC';
       } else if (tokenAddress === wethAddress) {
         tokenType = 'WETH';
       } else {
@@ -477,7 +479,9 @@ class BlockchainWatcher {
       const transferEventTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
       const watchedAddresses = Array.from(this.watchedWallets.keys()).map(addr => addr.toLowerCase());
 
-      // Only examine logs for ERC20 transfers (logging suppressed)
+      console.log(`\n🔍 Examining transaction ${txHash.substring(0, 10)}... for ERC20 transfers`);
+      console.log(`Found ${receipt.logs.length} logs to check`);
+      console.log(`Watched wallets for comparison: ${watchedAddresses.join(', ')}`);
 
       for (const log of receipt.logs) {
         // Skip any logs that don't have topics
@@ -502,36 +506,27 @@ class BlockchainWatcher {
           // Extract value from data field
           const value = BigInt(log.data) || 0n;
 
-          // Check if recipient is watched without excessive logging
+          console.log(`Found ERC20 transfer - To: ${to}, Value: ${value.toString()}`);
+
+          // Debug log to trace recipient address matching
+          console.log(`Comparing recipient ${to} with watched wallets...`);
+          const isWatched = watchedAddresses.includes(to);
+          console.log(`Is recipient watched? ${isWatched}`);
           
           // Only process if the recipient is a watched wallet
-          const isWatched = this.watchedWallets.has(to);
           if (isWatched) {
-            // Determine token type (USDC or WETH) before logging
-            const usdcAddress = process.env.USDC_CONTRACT_ADDRESS.toLowerCase();
-            const wethAddress = '0x4200000000000000000000000000000000000006'.toLowerCase();
-            
-            // Get token type based on contract address
-            let tokenType = 'UNKNOWN';
-            if (tokenAddress === usdcAddress) {
-              tokenType = 'USDC';
-            } else if (tokenAddress === wethAddress) {
-              tokenType = 'WETH';
-            } else {
-              tokenType = 'ERC20';
-            }
-            
-            console.log(`\n🎯 Detected ${tokenType} transfer to watched wallet ${to}!`);
-            console.log(`Transaction details:\n - Hash: ${txHash}\n - From: ${from}\n - Value: ${value.toString()} ${tokenType}`);
             console.log(`\n✅ ERC20 TRANSFER to watched wallet detected:`);
             console.log(` - Token: ${tokenAddress}`);
             console.log(` - From: ${from}`);
             console.log(` - To: ${to}`);
             console.log(` - Value: ${value.toString()} (raw value)`);
 
-            // tokenType already declared above
+            // Determine token type (USDC or WETH)
+            const usdcAddress = process.env.USDC_CONTRACT_ADDRESS.toLowerCase();
+            const wethAddress = '0x4200000000000000000000000000000000000006'.toLowerCase();
+
+            let tokenType;
             if (tokenAddress === usdcAddress) {
-              // Re-assign for consistency
               tokenType = 'USDC';
             } else if (tokenAddress === wethAddress) {
               tokenType = 'WETH';
@@ -670,7 +665,7 @@ class BlockchainWatcher {
         return;
       }
       
-      // Only log transactions relevant to watched wallets
+      console.log(`\n⚡ WEBSOCKET NOTIFICATION: Received transaction ${txHash}`);
       
       // Skip if we've already processed this transaction
       if (this.processedTransactions.has(txHash)) {
@@ -694,12 +689,16 @@ class BlockchainWatcher {
       }
       
       // Log transaction details
-      // Only log transactions for watched wallets
+      console.log(`Processing transaction: ${txHash.substring(0, 10)}...`);
+      console.log(`Transaction details:`);
+      console.log(` - From: ${tx.from || 'unknown'}`);
+      console.log(` - To: ${tx.to || 'unknown'}`);
+      console.log(` - Value: ${tx.value ? ethers.formatEther(tx.value) : '0'} ETH`);
       
       // First, check if this is a direct ETH transfer to a watched wallet
       const to = tx.to ? tx.to.toLowerCase() : null;
       if (to && this.watchedWallets.has(to)) {
-        console.log(`\n🎯 Detected ETH transfer to watched wallet ${to}`);
+        console.log(`✅ DIRECT MATCH: ETH transfer to watched wallet ${to}`);
         // Process ETH transfer
         const timestamp = Math.floor(Date.now() / 1000);
         await this.checkTransaction(tx, timestamp);
@@ -1248,80 +1247,25 @@ class BlockchainWatcher {
       }
       
       if (finalDonationAmount > 0) {
-        try {
-          // Check if donation would exceed season goal and adjust if needed
-          console.log(`Checking season goal for ${recipient} before processing donation...`);
-          const seasonCheck = await seasonGoalService.checkAndAdjustDonation(recipient, finalDonationAmount);
-          
-          // If season goal check indicates an adjustment is needed
-          if (seasonCheck.needsAdjustment) {
-            // Convert adjusted amount to BigInt
-            const adjustedAmount = BigInt(seasonCheck.adjustedAmount);
-            
-            // If the adjusted amount is zero, season goal is already met
-            if (adjustedAmount === 0n) {
-              console.log(`⚠️ Season goal already met for wallet ${recipient}. Skipping donation.`);
-              continue; // Skip this donation entirely
-            }
-            
-            // Update the donation amount to the adjusted amount
-            finalDonationAmount = adjustedAmount;
-            console.log(`📊 Adjusted donation amount to ${ethers.formatUnits(adjustedAmount, 6)} USDC to meet season goal exactly`);
-            
-            // Log completion of goal if applicable
-            if (seasonCheck.isGoalComplete) {
-              console.log(`🎉 This donation completes the season goal for wallet ${recipient}!`);
-            }
-          }
-          
-          // Now queue the donation for processing with possibly adjusted amount
-          this.queueDonation({
-            from: recipient,                          // Watched wallet (sending the donation)
-            originalFrom: transactionData.from,        // Original transaction sender
-            originalTo: recipient,                    // Original transaction recipient (watched wallet)
-            txHash: txHash,
-            assetType: assetType,
-            originalValue: valueAmount.toString(),
-            usdcEquivalent: usdcEquivalent.toString(), // Store original USDC equivalent
-            usdcFormatted: usdcFormatted,             // Store formatted USDC value
-            to: config.target,                        // The donation recipient address from the config
-            authorized: config.authorized,             // The contract authorized to spend tokens
-            configId: config.id,                       // Config ID to update records later
-            donationAmount: finalDonationAmount.toString(),
-            percentAmount: donationPercentage,
-            seasonInfo: seasonCheck.isGoalComplete ? {
-              seasonId: seasonCheck.seasonId,
-              isGoalComplete: true,
-              totalDonated: seasonCheck.totalDonated,
-              goalAmount: seasonCheck.goalAmount
-            } : undefined,
-            timestamp: blockTimestamp || Math.floor(Date.now() / 1000)  // Use block timestamp
-          });
-          
-          console.log(`Queued donation of ${ethers.formatUnits(finalDonationAmount, 6)} USDC (${donationPercentage}%) to ${config.target}`);
-        } catch (error) {
-          console.error(`Error checking season goal for wallet ${recipient}:`, error);
-          
-          // Fall back to original donation amount if season check fails
-          this.queueDonation({
-            from: recipient,                          // Watched wallet (sending the donation)
-            originalFrom: transactionData.from,        // Original transaction sender
-            originalTo: recipient,                    // Original transaction recipient (watched wallet)
-            txHash: txHash,
-            assetType: assetType,
-            originalValue: valueAmount.toString(),
-            usdcEquivalent: usdcEquivalent.toString(), // Store original USDC equivalent
-            usdcFormatted: usdcFormatted,             // Store formatted USDC value
-            to: config.target,                        // The donation recipient address from the config
-            authorized: config.authorized,             // The contract authorized to spend tokens
-            configId: config.id,                       // Config ID to update records later
-            donationAmount: finalDonationAmount.toString(),
-            percentAmount: donationPercentage,
-            timestamp: blockTimestamp || Math.floor(Date.now() / 1000)  // Use block timestamp
-          });
-          
-          console.log(`Queued donation of ${ethers.formatUnits(finalDonationAmount, 6)} USDC (${donationPercentage}%) to ${config.target}`);
-        }
+        // Now queue the donation for processing
+        this.queueDonation({
+          from: recipient,                          // Watched wallet (sending the donation)
+          originalFrom: transactionData.from,        // Original transaction sender
+          originalTo: recipient,                    // Original transaction recipient (watched wallet)
+          txHash: txHash,
+          assetType: assetType,
+          originalValue: valueAmount.toString(),
+          usdcEquivalent: usdcEquivalent.toString(), // Store original USDC equivalent
+          usdcFormatted: usdcFormatted,             // Store formatted USDC value
+          to: config.target,                        // The donation recipient address from the config
+          authorized: config.authorized,             // The contract authorized to spend tokens
+          configId: config.id,                       // Config ID to update records later
+          donationAmount: finalDonationAmount.toString(),
+          percentAmount: donationPercentage,
+          timestamp: blockTimestamp || Math.floor(Date.now() / 1000)  // Use block timestamp
+        });
+        
+        console.log(`Queued donation of ${finalDonationAmount / BigInt(1e6)} USDC (${donationPercentage}%) to ${config.target}`);
       } else {
         console.log(`⚠️ Final donation amount is still zero. Transaction too small to generate a meaningful donation.`);
       }
