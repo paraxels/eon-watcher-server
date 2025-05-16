@@ -74,20 +74,24 @@ class PriceFeed {
       // Get current ETH price
       const ethPrice = this.getEtherPrice();
       
-      // Convert from Wei to ETH
-      const ethValue = Number(ethAmount) / 1e18;
+      // Use BigInt throughout to preserve precision
+      // Convert price to BigInt with 18 decimal precision
+      const ethPriceBigInt = BigInt(Math.floor(ethPrice * 1e18));
       
-      // Calculate USD value
-      const usdValue = ethValue * ethPrice;
+      // Calculate USD value: (ethAmount * ethPriceBigInt) / 1e18 = USD value with 18 decimals
+      const usdValueBigInt = (BigInt(ethAmount) * ethPriceBigInt) / BigInt(1e18);
       
-      // Convert to USDC with 6 decimals
-      const usdcAmount = BigInt(Math.floor(usdValue * 1e6));
+      // Convert to USDC with 6 decimals (from 18 decimals)
+      // Division by 1e12 converts from 18 to 6 decimal places
+      const usdcAmount = usdValueBigInt / BigInt(1e12);
+      
+      console.log(`Converting ETH amount ${ethAmount} (${Number(ethAmount) / 1e18} ETH) to ${usdcAmount} USDC units (${Number(usdcAmount) / 1e6} USDC)`);
       
       return usdcAmount;
     } catch (error) {
       console.error('Error converting ETH to USDC:', error.message);
       // Default fallback calculation if conversion fails
-      return (ethAmount * BigInt(2000)) / BigInt(1e12); // Assuming $3000 per ETH and adjusting decimals
+      return (BigInt(ethAmount) * BigInt(2000)) / BigInt(1e12); // Assuming $2000 per ETH and adjusting decimals
     }
   }
 }

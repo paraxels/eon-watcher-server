@@ -1,9 +1,11 @@
 const cron = require('cron');
 const donationService = require('../services/donation');
+const seasonGoalService = require('../services/seasonGoals');
 
 class Scheduler {
   constructor() {
     this.donationJob = null;
+    this.seasonGoalJob = null;
   }
   
   // Calculate when the next donation is due based on frequency
@@ -39,7 +41,17 @@ class Scheduler {
       'UTC'
     );
     
+    // Schedule season goal check job (default to every 6 hours)
+    this.seasonGoalJob = new cron.CronJob(
+      process.env.SEASON_GOAL_SCHEDULE || '0 */6 * * *', 
+      this.runSeasonGoalJob.bind(this),
+      null,
+      true,
+      'UTC'
+    );
+    
     console.log(`Donation job scheduled with pattern: ${process.env.TRANSACTION_SCHEDULE || '0 * * * *'}`);
+    console.log(`Season goal check job scheduled with pattern: ${process.env.SEASON_GOAL_SCHEDULE || '0 */6 * * *'}`);
     console.log('Job scheduler started');
   }
 
@@ -47,6 +59,11 @@ class Scheduler {
     if (this.donationJob) {
       this.donationJob.stop();
       console.log('Donation job stopped');
+    }
+    
+    if (this.seasonGoalJob) {
+      this.seasonGoalJob.stop();
+      console.log('Season goal check job stopped');
     }
   }
 
@@ -64,6 +81,22 @@ class Scheduler {
   async triggerDonationJob() {
     console.log('Manually triggering donation job...');
     return this.runDonationJob();
+  }
+  
+  async runSeasonGoalJob() {
+    console.log('Running scheduled season goal check job...');
+    try {
+      const result = await seasonGoalService.updateAllSeasonGoals();
+      console.log('Season goal check job completed:', result);
+    } catch (error) {
+      console.error('Error running season goal check job:', error);
+    }
+  }
+  
+  // Method to manually trigger the season goal check job
+  async triggerSeasonGoalJob() {
+    console.log('Manually triggering season goal check job...');
+    return this.runSeasonGoalJob();
   }
 }
 
