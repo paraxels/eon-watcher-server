@@ -100,6 +100,9 @@ class BlockchainWatcher {
       // Set up monitoring for ERC20 token transfers
       this.setupERC20Monitoring();
       
+      // Set up dedicated monitoring for USDC transfers
+      this.setupUSDCTransferMonitoring();
+      
       // No longer using block scanning, relying on WebSockets exclusively
       console.log(`\n⚡ Using real-time WebSocket monitoring for transactions - no catch-up needed`);
       
@@ -222,7 +225,8 @@ class BlockchainWatcher {
     // Common ERC20 tokens to monitor (add more as needed)
     const tokenAddresses = [
       process.env.USDC_CONTRACT_ADDRESS.toLowerCase(), // USDC
-      '0x4200000000000000000000000000000000000006' // WETH on Base
+      '0x4200000000000000000000000000000000000006', // WETH on Base
+      '0x3dA41Dc20a8b6e52F12eF5706Da9613d5867eF86'  // Tipn contract - monitor Tipn contract too
     ];
     
     // Create an interface for decoding ERC20 Transfer events
@@ -244,6 +248,163 @@ class BlockchainWatcher {
     console.log(`Monitoring ${watchedWallets.length} wallets for ERC20 token transfers`);
     
     console.log('ERC20 token transfer monitoring set up successfully');
+  }
+  
+  // Set up dedicated monitoring for USDC Transfer events with an approach focused solely on transfers
+  setupUSDCTransferMonitoring() {
+    if (!this.alchemy) {
+      console.log('Alchemy API not configured, skipping dedicated USDC transfer monitoring.');
+      return;
+    }
+
+    console.log('\n✨ Setting up dedicated USDC Transfer event monitoring (PURE TRANSFER FOCUS)...');
+    console.log('   This approach focuses only on the transfers themselves, not initiating contracts/functions');
+    
+    const usdcContractAddress = process.env.USDC_CONTRACT_ADDRESS?.toLowerCase();
+    if (!usdcContractAddress) {
+      console.error('❌ USDC contract address not configured, cannot monitor USDC transfers');
+      return;
+    }
+    console.log(`USDC contract address: ${usdcContractAddress}`);
+    
+    // Get list of watched wallets
+    const watchedAddresses = Array.from(this.watchedWallets.keys()).map(addr => addr.toLowerCase());
+    
+    if (watchedAddresses.length === 0) {
+      console.log('No wallets to watch, skipping USDC transfer monitoring.');
+      return;
+    }
+    
+    console.log(`Monitoring ${watchedAddresses.length} wallets for USDC transfers:`);
+    watchedAddresses.forEach((addr, i) => console.log(`  ${i+1}. ${addr}`));
+    
+    // APPROACH 1: Monitor USDC contract transactions directly
+    console.log('\nApproach 1: Direct USDC contract monitoring');
+    this.alchemy.ws.on(
+      {
+        method: AlchemySubscription.MINED_TRANSACTIONS,
+        addresses: [{ to: usdcContractAddress }],
+        includeRemoved: false,
+        hashesOnly: false
+      },
+      async (tx) => {
+        try {
+          const txHash = tx.transaction?.hash;
+          if (!txHash) return;
+          
+          console.log(`Checking USDC contract transaction: ${txHash.substring(0, 10)}...`);
+          
+          // Use our dedicated helper function to detect USDC transfers to watched wallets
+          await this.checkForUSDCTransfers(txHash);
+        } catch (error) {
+          console.error(`Error processing USDC contract transaction: ${error.message}`);
+        }
+      }
+    );
+    
+    // APPROACH 2: Monitor Tipn contract transactions specifically
+    // Since we know this contract often initiates USDC transfers indirectly
+    const tipnContractAddress = '0x3dA41Dc20a8b6e52F12eF5706Da9613d5867eF86'.toLowerCase();
+    console.log('\nApproach 2: Tipn contract monitoring');
+    console.log(`Tipn contract address: ${tipnContractAddress}`);
+    
+    this.alchemy.ws.on(
+      {
+        method: AlchemySubscription.MINED_TRANSACTIONS,
+        addresses: [{ to: tipnContractAddress }],
+        includeRemoved: false,
+        hashesOnly: false
+      },
+      async (tx) => {
+        try {
+          const txHash = tx.transaction?.hash;
+          if (!txHash) return;
+          
+          console.log(`Checking Tipn contract transaction: ${txHash.substring(0, 10)}...`);
+          
+          // Use our dedicated helper function to detect USDC transfers to watched wallets
+          // This will catch ALL USDC transfers initiated by ANY function in the contract
+          await this.checkForUSDCTransfers(txHash);
+        } catch (error) {
+          console.error(`Error processing Tipn contract transaction: ${error.message}`);
+        }
+      }
+    );
+    
+    // APPROACH 3: Direct monitoring of transactions to watched wallets
+    console.log('\nApproach 3: Direct wallet transaction monitoring');
+    this.alchemy.ws.on(
+      {
+        method: AlchemySubscription.MINED_TRANSACTIONS,
+        addresses: watchedAddresses.map(address => ({ to: address })),
+        includeRemoved: false,
+        hashesOnly: false
+      },
+      async (txData) => {
+        try {
+          const txHash = txData.transaction?.hash;
+          if (!txHash) return;
+          
+          // Use our dedicated helper function
+          await this.checkForUSDCTransfers(txHash);
+        } catch (error) {
+          console.error(`Error processing direct wallet transaction: ${error.message}`);
+        }
+      }
+    );
+    
+    // APPROACH 4: Block-level monitoring as an additional safety net
+    // This ensures we catch transfers that might be missed by the other approaches
+    console.log('\nApproach 4: Block-level safety net');
+    
+    // Track which blocks we've processed to avoid duplicate work
+    const processedBlocks = new Set();
+    
+    // Monitor new blocks
+    this.provider.on('block', async (blockNumber) => {
+      try {
+        // Only process every few blocks to reduce load
+        if (blockNumber % 5 !== 0) return;
+        
+        // Skip if we've already processed this block
+        if (processedBlocks.has(blockNumber)) return;
+        processedBlocks.add(blockNumber);
+        
+        // Maintain a reasonable size for the processed blocks set
+        if (processedBlocks.size > 100) {
+          const oldestEntries = Array.from(processedBlocks).slice(0, 20);
+          oldestEntries.forEach(block => processedBlocks.delete(block));
+        }
+        
+        console.log(`Scanning block ${blockNumber} for USDC transfers to watched wallets...`);
+        
+        try {
+          // Get the block with transaction hashes
+          const block = await this.provider.getBlock(blockNumber, true);
+          if (!block || !block.transactions || block.transactions.length === 0) return;
+          
+          // Only check the first 50 transactions in the block for performance reasons
+          // This is a safety net, so we don't need to be exhaustive
+          const txsToCheck = block.transactions.slice(0, 50);
+          
+          // Check each transaction for USDC transfers to watched wallets
+          for (const txHash of txsToCheck) {
+            await this.checkForUSDCTransfers(txHash);
+          }
+        } catch (blockError) {
+          console.error(`Error processing block ${blockNumber}:`, blockError.message);
+        }
+      } catch (error) {
+        console.error('Error in block monitoring:', error.message);
+      }
+    });
+    
+    console.log('\n✅ Comprehensive USDC Transfer event monitoring set up with multiple layers:');
+    console.log('   1. Direct USDC contract monitoring');
+    console.log('   2. Tipn contract monitoring (catches indirect transfers)');
+    console.log('   3. Direct watched wallet monitoring');
+    console.log('   4. Block-level safety net');
+    console.log('\n   This system will detect ALL USDC transfers to watched wallets regardless of source!');
   }
 
   // Start monitoring the blockchain for transactions to watched wallets
@@ -898,26 +1059,77 @@ class BlockchainWatcher {
     try {
       // ERC20 Transfer event signature
       const transferEventTopic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+      const usdcAddress = process.env.USDC_CONTRACT_ADDRESS.toLowerCase();
+      
+      if (!usdcAddress) {
+        console.error('USDC_CONTRACT_ADDRESS not configured in environment variables');
+        return;
+      }
       
       // Check each log for Transfer events
       for (const log of receipt.logs) {
         try {
-          // Check if this is a Transfer event (topic 0 is the event signature)
-          if (log.topics[0] === transferEventTopic && log.topics.length === 3) {
-            // Extract addresses (remove padding and leading zeros)
-            const from = '0x' + log.topics[1].substring(26);
-            const to = '0x' + log.topics[2].substring(26);
+          // FOCUS ON USDC TRANSFERS: Check if this is a USDC Contract Transfer event
+          if (log.address.toLowerCase() === usdcAddress && 
+              log.topics[0] === transferEventTopic && 
+              log.topics.length >= 3) {
             
-            // Extract amount from data field
+            // Extract addresses (remove padding and leading zeros)
+            const from = '0x' + log.topics[1].substring(26).toLowerCase();
+            const to = '0x' + log.topics[2].substring(26).toLowerCase();
+            
+            // Check if recipient is a watched wallet
+            if (this.watchedWallets.has(to)) {
+              // Extract amount from data field
+              const value = BigInt(log.data);
+              
+              console.log(`\n🚨 USDC TRANSFER TO WATCHED WALLET DETECTED!`);
+              console.log(`Transaction: ${txHash}`);
+              console.log(`From: ${from}`);
+              console.log(`To: ${to}`);
+              console.log(`Value: ${value.toString()}`);
+              
+              // Skip if we've already processed this transaction
+              if (this.processedTransactions.has(txHash)) {
+                console.log(`Transaction ${txHash.substring(0, 10)}... already processed, skipping.`);
+                continue;
+              }
+              
+              // Mark this transaction as processed to avoid duplicate processing
+              this.processedTransactions.add(txHash);
+              
+              // Prune old transactions if needed
+              if (this.processedTransactions.size > this.maxTrackedTransactions) {
+                const toRemove = Math.floor(this.maxTrackedTransactions * 0.2); // Remove 20%
+                const oldestEntries = Array.from(this.processedTransactions).slice(0, toRemove);
+                oldestEntries.forEach(hash => this.processedTransactions.delete(hash));
+                console.log(`Pruned ${toRemove} old transaction hashes from memory`);
+              }
+              
+              // Get block timestamp
+              const blockTimestamp = receipt.blockNumber ? 
+                (await this.provider.getBlock(receipt.blockNumber)).timestamp : 
+                Math.floor(Date.now() / 1000);
+              
+              // Process as a USDC transfer
+              await this.processValueTransfer(to, value, txHash, 'USDC', blockTimestamp);
+              
+              console.log(`✅ Successfully processed USDC transfer to ${to}\n`);
+            }
+          }
+          // Regular handling for other token transfers (not USDC)
+          else if (log.topics[0] === transferEventTopic && 
+                  log.topics.length >= 3 && 
+                  this.monitoredTokens.has(log.address.toLowerCase())) {
+            
+            // Extract addresses
+            const from = '0x' + log.topics[1].substring(26).toLowerCase();
+            const to = '0x' + log.topics[2].substring(26).toLowerCase();
+            
+            // Extract amount
             const value = BigInt(log.data);
             
-            console.log(`Detected Transfer event in transaction ${txHash}:`);
-            console.log(`Token: ${log.address}`);
-            console.log(`From: ${from}`);
-            console.log(`To: ${to}`);
-            console.log(`Value: ${value.toString()}`);
-            
-            // Process it as an ERC20 transfer
+            // Process other ERC20 transfers
             await this.processERC20Transfer(log.address, from, to, value, txHash);
           }
         } catch (error) {
@@ -926,6 +1138,36 @@ class BlockchainWatcher {
       }
     } catch (error) {
       console.error(`Error processing receipt logs:`, error);
+    }
+  }
+  
+  // New helper function to check for USDC transfers in ANY transaction
+  // This is specifically designed to catch ALL USDC transfers to watched wallets
+  // regardless of which contract or function initiated the transfer
+  async checkForUSDCTransfers(txHash) {
+    try {
+      if (!txHash) return false;
+      
+      // Skip if we've already processed this transaction
+      txHash = txHash.toLowerCase();
+      if (this.processedTransactions.has(txHash)) {
+        return false;
+      }
+      
+      // Fetch the receipt
+      const receipt = await this.getReceiptWithRetries(txHash);
+      if (!receipt || !receipt.logs || receipt.logs.length === 0) {
+        return false;
+      }
+      
+      // Use our enhanced receipt log processing function
+      // which specifically looks for USDC transfers to watched wallets
+      await this.processReceiptLogs(receipt, txHash);
+      
+      return true;
+    } catch (error) {
+      console.error(`Error checking for USDC transfers in ${txHash}:`, error);
+      return false;
     }
   }
   
