@@ -1,12 +1,19 @@
 const { connectDB } = require('./services/database');
 const blockchainService = require('./services/blockchain');
 const priceFeed = require('./services/priceFeed');
-const watcher = require('./services/watcher');
+const moralisWatcher = require('./services/moralisWatcher');
+const { startExpressServer } = require('./server'); // Import the Express server
 require('dotenv').config();
 
 async function startWatcherService() {
   try {
     console.log('Starting EON Transaction Watcher Service...');
+    
+    // First, start the Express server so the webhook endpoint is active
+    // This is CRITICAL - must happen before Moralis tries to verify the webhook
+    console.log('Starting Express server...');
+    const expressServer = await startExpressServer();
+    console.log('Express server started successfully!');
     
     // Connect to MongoDB to read wallet data
     await connectDB();
@@ -20,9 +27,9 @@ async function startWatcherService() {
     await priceFeed.init();
     console.log('Price feed service initialized');
     
-    // Start transaction watcher
-    await watcher.init();
-    console.log('Transaction watcher started');
+    // Start Moralis transaction watcher
+    await moralisWatcher.init();
+    console.log('Moralis transaction watcher started');
     
     console.log('EON Transaction Watcher Service is running');
     

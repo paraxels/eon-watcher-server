@@ -1,24 +1,16 @@
 const { ethers } = require('ethers');
-const { Alchemy, Network, AlchemySubscription } = require('alchemy-sdk');
 const ExistingWallet = require('../models/ExistingWallet');
 const TransactionRecord = require('../models/TransactionRecord');
 const blockchainService = require('./blockchain');
 const priceFeed = require('./priceFeed');
 const seasonGoalService = require('./seasonGoals');
+const moralisService = require('./moralis');
 require('dotenv').config();
 
 class BlockchainWatcher {
   constructor() {
-    // Configure Alchemy provider
-    const alchemyApiKey = process.env.ALCHEMY_API_KEY || '';
-    const usingAlchemy = !!alchemyApiKey;
-    
     // Determine which RPC URL to use
-    const baseRpcUrl = process.env.BASE_RPC_URL;
-    const alchemyRpcUrl = process.env.ALCHEMY_BASE_RPC_URL || `https://base-mainnet.g.alchemy.com/v2/${alchemyApiKey}`;
-    
-    const rpcUrl = usingAlchemy ? alchemyRpcUrl : baseRpcUrl;
-    console.log(`Using RPC endpoint: ${usingAlchemy ? 'Alchemy (higher rate limits)' : 'Public RPC'}`);
+    const rpcUrl = process.env.BASE_RPC_URL || process.env.ALCHEMY_BASE_RPC_URL;
     console.log(`Using RPC endpoint: ${rpcUrl}`);
     
     // Create the provider with improved settings for rate limiting
@@ -30,18 +22,8 @@ class BlockchainWatcher {
       batchMaxSize: 5        // Maximum of 5 requests in a batch (reduced batch size)
     });
     
-    // Initialize Alchemy SDK if API key is available
-    if (usingAlchemy) {
-      const alchemyConfig = {
-        apiKey: alchemyApiKey,
-        network: Network.BASE_MAINNET
-      };
-      this.alchemy = new Alchemy(alchemyConfig);
-      console.log('Alchemy SDK initialized successfully');
-    } else {
-      console.log('No Alchemy API key provided, WebSocket monitoring disabled');
-      this.alchemy = null;
-    }
+    // We'll be using Moralis for blockchain monitoring instead of Alchemy
+    console.log('Using Moralis for blockchain monitoring');
 
     this.watchedWallets = new Map(); // Map of address -> donation settings
     this.transactionQueue = [];
@@ -53,6 +35,9 @@ class BlockchainWatcher {
     
     // Maximum number of transactions to keep in the set (to prevent memory leaks)
     this.maxTrackedTransactions = 5000;
+    
+    // Track whether the watched wallets have been synced to Moralis
+    this.walletsSyncedToMoralis = false;
   }
 
   // Utility: Only log if there are watched wallets
@@ -71,10 +56,9 @@ class BlockchainWatcher {
       const latestBlockNumber = await this.provider.getBlockNumber();
       console.log(`Current chain head is at block ${latestBlockNumber}`);
       
-      // With WebSocket approach, we don't need to track blocks or determine starting points
-      // but we'll store the current block number for reference
+      // Store the current block number for reference
       this.lastProcessedBlock = latestBlockNumber;
-      console.log(`Using WebSocket monitoring - will detect all new transactions in real-time`);
+      console.log(`Using Moralis webhook monitoring - will detect all new transactions in real-time`);
       console.log(`Current block: ${this.lastProcessedBlock}`);
       
       // Load initial set of wallets from database
@@ -94,13 +78,8 @@ class BlockchainWatcher {
       // Set up wallet refresh loop
       this.startWalletRefreshLoop();
       
-      // Set up blockchain monitoring for ETH transfers
-      this.startBlockchainMonitoring();
-      
-      // Set up monitoring for ERC20 token transfers
-      this.setupERC20Monitoring();
-      
-      // Set up dedicated monitoring for USDC transfers
+      // Initialize Moralis monitoring (will sync watched wallets)
+      await this.setupMoralisMonitoring();
       this.setupUSDCTransferMonitoring();
       
       // No longer using block scanning, relying on WebSockets exclusively
@@ -116,37 +95,32 @@ class BlockchainWatcher {
   // Load/refresh wallets from MongoDB
   async refreshWatchedWallets() {
     try {
-      this.logWatched('Refreshing watched wallets from database...');
+      console.log('Refreshing watched wallets from database...');
       
-      // Get all active wallet configurations from the database
-      // Sort by timestamp in descending order to get the most recent records first
-      const walletConfigs = await ExistingWallet.find({
-        active: true,
-        walletAddress: { $exists: true },
-        target: { $exists: true },
-        percentAmount: { $exists: true },
-      }).sort({ timestamp: -1 });
+      // Fetch all wallets with donation settings
+      const wallets = await ExistingWallet.find({
+        'donationSettings.amount': { $exists: true, $ne: null }
+      });
       
-      this.logWatched(`Found ${walletConfigs.length} wallet configurations`);
+      console.log(`Found ${wallets.length} wallets with donation settings`);
       
-      // A set to track which wallets we've already processed
-      // We only want the most recent configuration for each wallet
-      const processedWallets = new Set();
+      // Create a new map with the updated wallets
+      const updatedWallets = new Map();
       
-      // Clear the current map
-      this.watchedWallets.clear();
-      
-      // Process each wallet configuration
-      for (const config of walletConfigs) {
-        // Skip if no wallet address or not properly configured
-        if (!config.walletAddress || !config.target || !config.percentAmount) {
-          this.logWatched(`Skipping invalid config: ${config._id} - missing required fields`);
-          continue;
-        }
+      for (const wallet of wallets) {
+        const address = wallet.address.toLowerCase();
+        
+        // Extract the donation settings
+        const config = {
+          id: wallet._id,
+          address: address,
+          donationSettings: wallet.donationSettings,
+          lastDonation: wallet.lastDonation || 0
+        };
         
         // CRITICAL: Normalize the wallet address - ALWAYS use lowercase for consistency
         // This fixes issues with address comparison
-        let walletAddress = config.walletAddress;
+        let walletAddress = config.address;
         
         // Ensure the address is properly formatted
         if (!walletAddress.startsWith('0x')) {
@@ -1302,9 +1276,25 @@ class BlockchainWatcher {
   }
 
   // Process an ERC20 token transfer
-  async processERC20Transfer(tokenAddress, from, to, value, txHash) {
+  async processERC20Transfer(tokenAddress, from, to, value, txHash, timestamp) {
+    // Validate that all required parameters are present
+    if (!tokenAddress || !from || !to || !txHash) {
+      console.error('Missing required parameters for processERC20Transfer:', {
+        tokenAddress, from, to, txHash
+      });
+      return;
+    }
+    
+    // Skip transactions with a value of 0
+    if (value === 0n || value === BigInt(0)) {
+      console.log(`Skipping zero-value ERC20 transfer: ${from} -> ${to}, Token: ${tokenAddress}`);
+      return;
+    }
+    
+    // Safely convert to lowercase
     const recipient = to.toLowerCase();
     txHash = txHash.toLowerCase();
+    const tokenAddr = tokenAddress.toLowerCase();
     
     // IMPORTANT: Skip if we've already processed this transaction
     // Note: Temporarily bypassing this check for testing purposes
@@ -1315,6 +1305,9 @@ class BlockchainWatcher {
     } else {
       console.log(`DEBUG: Transaction ${txHash} has not been processed before`);
     }
+    
+    console.log(`Checking if wallet ${recipient} is in watched wallets list...`);
+    console.log(`Currently watching ${this.watchedWallets.size} wallets`);
     
     // Check if the recipient is one of our watched wallets
     if (this.watchedWallets.has(recipient)) {
@@ -1334,7 +1327,11 @@ class BlockchainWatcher {
         let usdcEquivalent;
         
         // Handle different tokens
-        if (tokenAddress.toLowerCase() === process.env.USDC_CONTRACT_ADDRESS.toLowerCase()) {
+      console.log(`Token address: ${tokenAddress.toLowerCase()}`);
+      console.log(`USDC contract address from env: ${process.env.USDC_CONTRACT_ADDRESS?.toLowerCase() || 'NOT DEFINED'}`);
+      
+      // Check if the token is USDC (more robust comparison)
+      if (tokenAddress.toLowerCase() === (process.env.USDC_CONTRACT_ADDRESS || '').toLowerCase()) {
           // It's already USDC, just use the value directly
           usdcEquivalent = value;
           // Safely format the USDC value using ethers.js formatUnits
@@ -1353,9 +1350,10 @@ class BlockchainWatcher {
         }
         
         // Process the donation based on the wallet's configuration
-        // Pass the block timestamp from the current block we're processing
-        const timestamp = Math.floor(Date.now() / 1000); // Default to current time
-        await this.processValueTransfer(recipient, value, txHash, tokenSymbol, timestamp);
+      // Use the provided timestamp or default to current time
+      const processTimestamp = timestamp || Math.floor(Date.now() / 1000);
+      console.log(`Using timestamp for donation: ${processTimestamp} (${new Date(processTimestamp * 1000).toISOString()})`);
+      await this.processValueTransfer(recipient, value, txHash, tokenSymbol, processTimestamp);
       } catch (error) {
         console.error(`Error processing ERC20 transfer: ${error.message}`);
       }
