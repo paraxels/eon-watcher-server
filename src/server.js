@@ -172,7 +172,7 @@ async function startExpressServer() {
   return new Promise((resolve, reject) => {
     try {
       // Start Express server and get the server instance
-      const server = app.listen(PORT, () => {
+      const server = app.listen(PORT, '0.0.0.0', () => {
         console.log(`=================================================`);
         console.log(`EXPRESS SERVER STARTED SUCCESSFULLY!`);
         console.log(`Server is running on port ${PORT}`);
