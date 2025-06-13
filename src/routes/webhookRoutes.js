@@ -109,6 +109,9 @@ async function processWebhookData(webhookData) {
     // Log the first 500 chars of the webhook data to avoid console flooding
     const webhookDataString = JSON.stringify(webhookData);
     
+    // Track processed transaction hashes to avoid duplicates
+    const processedTxHashes = new Set();
+    
     // IMPORTANT: Capture ALL logs and events, then filter locally
     // -------------- Process Contract Logs (for ERC20 Transfers) --------------
     const logs = webhookData.logs || [];
@@ -156,6 +159,8 @@ async function processWebhookData(webhookData) {
               txHash,
               timestamp
             );
+            // Mark this transaction as processed
+            if (txHash) processedTxHashes.add(txHash);
           } else {
             console.log(`Ignoring transfer for non-monitored token: ${tokenAddress}`);
           }
@@ -184,6 +189,12 @@ async function processWebhookData(webhookData) {
         let timestamp = Math.floor(Date.now() / 1000); // Default to current time
         if (webhookData.block && webhookData.block.timestamp) {
           timestamp = parseInt(webhookData.block.timestamp);
+        }
+        
+        // Skip if we've already processed this transaction
+        if (txHash && processedTxHashes.has(txHash)) {
+          console.log(`Skipping already processed transaction from erc20Transfers: ${txHash}`);
+          continue;
         }
         
         // Check if this is a token we care about (USDC or WETH for now)

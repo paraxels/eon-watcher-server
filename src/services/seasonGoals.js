@@ -1,6 +1,7 @@
 const mongoose = require('mongoose');
 const ExistingWallet = require('../models/ExistingWallet');
 const TransactionRecord = require('../models/TransactionRecord');
+const { sendSeasonCompletionNotification } = require('./notifications');
 
 class SeasonGoalService {
   /**
@@ -388,6 +389,15 @@ class SeasonGoalService {
   async markSeasonCompleted(seasonId) {
     try {
       const currentTimestamp = Math.floor(Date.now() / 1000);
+      
+      // First get the season record to ensure we have the FID
+      const season = await ExistingWallet.findById(seasonId);
+      if (!season) {
+        console.error(`Season ${seasonId} not found`);
+        return false;
+      }
+
+      // Update the season record
       const result = await ExistingWallet.findByIdAndUpdate(
         seasonId,
         { 
@@ -400,6 +410,20 @@ class SeasonGoalService {
       );
       
       console.log(`Marked season ${seasonId} as completed with lastDonation=${currentTimestamp}`);
+
+      // Send notification if we have a FID
+      if (season.fid) {
+        try {
+          await sendSeasonCompletionNotification(season.fid);
+          console.log(`Sent season completion notification to FID ${season.fid}`);
+        } catch (error) {
+          console.error(`Failed to send season completion notification:`, error);
+          // Don't throw here - we still want to return success for the season completion
+        }
+      } else {
+        console.log(`No FID found for season ${seasonId}, skipping notification`);
+      }
+
       return true;
     } catch (error) {
       console.error(`Error marking season ${seasonId} as completed:`, error);
