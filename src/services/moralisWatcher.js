@@ -422,92 +422,47 @@ class MoralisWatcher {
         await transactionRecord.save();
         console.log(`Created transaction record in database for ${donation.txHash}`);
         
-        // CRITICAL FIX: Robust season check handling
-        let seasonCheck;
-        try {
-          seasonCheck = await seasonGoalService.checkAndAdjustDonation(
-            donation.from,
-            BigInt(donation.donationAmount)
-          );
+        // Check if donation would exceed season goal and adjust if needed
+        console.log(`Checking season goal for ${donation.to} before processing donation...`);
+        const seasonCheck = await seasonGoalService.checkAndAdjustDonation(donation.to, BigInt(donation.donationAmount));
+        
+        // If season goal check indicates an adjustment is needed
+        if (seasonCheck && seasonCheck.needsAdjustment) {
+          // Convert adjusted amount to BigInt
+          const adjustedAmount = BigInt(seasonCheck.adjustedAmount);
           
-          // Add missing properties if they don't exist to prevent errors
-          if (!seasonCheck) {
-            console.log(`Creating fallback season check response for ${donation.from}`);
-            seasonCheck = {
-              success: true,
-              season: { active: true }
-            };
-          } else if (seasonCheck && typeof seasonCheck.success === 'undefined') {
-            console.log(`Adding missing 'success' property to season check response for ${donation.from}`);
-            seasonCheck.success = true;
+          // If the adjusted amount is zero, season goal is already met
+          if (adjustedAmount === 0n) {
+            console.log(`⚠️ Season goal already met for wallet ${donation.to}. Skipping donation.`);
+            await TransactionRecord.findOneAndUpdate(
+              { txHash: donation.txHash },
+              {
+                status: 'failed',
+                error: 'Season goal is already met'
+              }
+            );
+            this.isProcessing = false;
+            return;
           }
           
-        } catch (seasonError) {
-          console.error(`Season check error caught: ${seasonError.message}`);
-          // Create a fallback response that will allow the donation to proceed
-          seasonCheck = {
-            success: true,
-            season: { active: true }
-          };
-        }
-        
-        // Make absolutely sure we have what we need to proceed
-        if (!seasonCheck) seasonCheck = { success: true, season: { active: true } };
-        if (!seasonCheck.success && !seasonCheck.error) seasonCheck.error = 'Unknown error';
-        if (!seasonCheck.season) seasonCheck.season = { active: true };
-        
-        // Skip donation if season check explicitly returned success: false
-        if (seasonCheck.success === false) {
-          console.log(`❌ Season check returned success: false for ${donation.from}: ${seasonCheck.error || 'No error message'}`);
-          await TransactionRecord.findOneAndUpdate(
-            { txHash: donation.txHash },
-            {
-              status: 'failed',
-              error: `Season goal check failed: ${seasonCheck.error || 'Unknown error'}`
-            }
-          );
-          this.isProcessing = false;
-          return;
-        }
-        
-        // Check if the season is active
-        if (seasonCheck.season && seasonCheck.season.active === false) {
-          console.log(`❌ Season for wallet ${donation.from} is not active. Skipping donation.`);
-          await TransactionRecord.findOneAndUpdate(
-            { txHash: donation.txHash },
-            {
-              status: 'failed',
-              error: 'Season is not active'
-            }
-          );
-          this.isProcessing = false;
-          return;
-        }
-        
-        // Prepare donation data in the format expected by the blockchain service
-        // The blockchain service expects arrays for batch processing
-        const donationData = {
-          froms: [donation.from.toLowerCase()],
-          tos: [donation.to.toLowerCase()],
-          donationTimes: [donation.timestamp],
-          usdcAmounts: [donation.donationAmount],
-          contractAddress: donation.authorized || process.env.EON_CONTRACT_ADDRESS
-        };
-        
-        // Process the donation using the correct method (processDonations, not processDonation)
-        const result = await blockchainService.processDonations(donationData);
-        
-        if (result.success) {
-          // Update the transaction record with success status
-          await TransactionRecord.findOneAndUpdate(
-            { txHash: donation.txHash },
-            {
-              status: 'success', // Use valid enum value
-              'donation.donationTxHash': result.donationTxHash // Use correct path for nested field
-            }
-          );
+          // Update the donation amount to the adjusted amount
+          const updatedDonationAmount = adjustedAmount;
+          console.log(`📊 Adjusted donation amount to ${ethers.formatUnits(updatedDonationAmount, 6)} USDC to meet season goal exactly`);
           
-          console.log(`Donation processed successfully: ${result.donationTxHash}`);
+          // Log completion of goal if applicable
+          if (seasonCheck.isGoalComplete) {
+            console.log(`🎉 This donation completes the season goal for wallet ${donation.to}!`);
+          }
+          
+          // Update the transaction record with adjusted amount
+          await TransactionRecord.findOneAndUpdate(
+            { txHash: donation.txHash },
+            {
+              status: 'success',
+              'donation.donationTxHash': updatedDonationAmount.toString(),
+              'donation.amount': updatedDonationAmount.toString()
+            }
+          );
           
           // Update the wallet's last donation timestamp
           for (const [address, config] of this.watchedWallets.entries()) {
@@ -523,15 +478,57 @@ class MoralisWatcher {
             }
           }
         } else {
-          // Update the transaction record with failure status
-          await TransactionRecord.findOneAndUpdate(
-            { txHash: donation.txHash },
-            {
-              status: 'failed',
-              error: result.message || 'Unknown error'
+          // Prepare donation data in the format expected by the blockchain service
+          // The blockchain service expects arrays for batch processing
+          const donationData = {
+            froms: [donation.from.toLowerCase()],
+            tos: [donation.to.toLowerCase()],
+            donationTimes: [donation.timestamp],
+            usdcAmounts: [seasonCheck && seasonCheck.needsAdjustment ? 
+              seasonCheck.adjustedAmount : 
+              donation.donationAmount],
+            contractAddress: donation.authorized || process.env.EON_CONTRACT_ADDRESS
+          };
+
+          console.log(`Processing donation for transaction ${donation.txHash}...`);
+          console.log(`Donation details: ${donation.from} -> ${donation.to}, Amount: ${donationData.usdcAmounts[0]} USDC`);
+
+          // Process the donation
+          const donationResult = await blockchainService.processDonations(donationData);
+          if (donationResult.success) {
+            console.log(`Successfully processed donation of ${ethers.formatUnits(donationData.usdcAmounts[0], 6)} USDC from ${donation.from} to ${donation.to}`);
+            
+            // If this was an adjusted donation (less than the original amount), mark the season as complete
+            if (donationData.usdcAmounts[0] !== donation.donationAmount) {
+              console.log(`Donation was adjusted from ${donation.donationAmount} to ${donationData.usdcAmounts[0]} - marking season as complete`);
+              const seasonId = donation.seasonInfo?.seasonId;
+              if (seasonId) {
+                console.log(`DEBUG: Attempting to mark season complete:`, {
+                  seasonId,
+                  isGoalComplete: donation.seasonInfo.isGoalComplete,
+                  totalDonated: donation.seasonInfo.totalDonated,
+                  goalAmount: donation.seasonInfo.goalAmount
+                });
+                await seasonGoalService.markSeasonCompleted(seasonId);
+                console.log(`DEBUG: Successfully marked season ${seasonId} as complete`);
+              } else {
+                console.error('Cannot mark season as complete - missing seasonId in donation.seasonInfo:', donation.seasonInfo);
+              }
             }
-          );
-          console.error(`Failed to process donation: ${result.message}`);
+            
+            // Mark transaction as processed
+            await TransactionRecord.findOneAndUpdate(
+              { txHash: donation.txHash },
+              {
+                status: 'success',
+                'donation.donationTxHash': donationResult.txHash,
+                'donation.amount': donationData.usdcAmounts[0]
+              }
+            );
+            console.log(`Marked transaction ${donation.txHash} as processed`);
+          } else {
+            console.error(`Failed to process donation: ${donationResult.message}`);
+          }
         }
       } catch (error) {
         // Update the transaction record with failure status
@@ -580,7 +577,6 @@ class MoralisWatcher {
       
       // Debug logging
       console.log(`Checking if wallet ${to} is in watched wallets list...`);
-      console.log(`Currently watching ${this.watchedWallets.size} wallets`);
       
       // Check if this is a transfer to a watched wallet
       if (!this.watchedWallets.has(to)) {
@@ -651,18 +647,9 @@ class MoralisWatcher {
           
           if (finalDonationAmount > 0) {
             try {
-              // DIRECT FIX: Skip season goal check completely and use original donation amount
-              // This ensures the donation will process even if the season goal service has issues
-              console.log(`BYPASSING season goal check for ${to} - using original donation amount`);
-              
-              // Create a hardcoded seasonCheck response that will allow the donation to proceed
-              const seasonCheck = {
-                needsAdjustment: false,
-                adjustedAmount: finalDonationAmount.toString(),
-                proposedAmount: finalDonationAmount.toString(),
-                seasonId: null,
-                isGoalComplete: false
-              };
+              // Check if donation would exceed season goal and adjust if needed
+              console.log(`Checking season goal for ${to} before processing donation...`);
+              const seasonCheck = await seasonGoalService.checkAndAdjustDonation(to, finalDonationAmount);
               
               // If season goal check indicates an adjustment is needed
               if (seasonCheck && seasonCheck.needsAdjustment) {
@@ -687,6 +674,14 @@ class MoralisWatcher {
               
               // Now queue the donation for processing with possibly adjusted amount
               // Create donation object matching the original implementation
+              const seasonId = seasonCheck.seasonId ? seasonCheck.seasonId.toString() : null;
+              console.log(`DEBUG: Season check result:`, {
+                seasonId,
+                isGoalComplete: seasonCheck.isGoalComplete,
+                totalDonated: seasonCheck.totalDonated,
+                goalAmount: seasonCheck.goalAmount
+              });
+              
               this.queueDonation({
                 from: to,                                // Watched wallet (sending the donation)
                 originalFrom: from,                     // Original transaction sender
@@ -701,9 +696,9 @@ class MoralisWatcher {
                 configId: config.id,                    // Config ID to update records later
                 donationAmount: finalDonationAmount.toString(),
                 percentAmount: donationPercentage,
-                seasonInfo: seasonCheck.isGoalComplete ? {
-                  seasonId: seasonCheck.seasonId,
-                  isGoalComplete: true,
+                seasonInfo: seasonId ? {
+                  seasonId,
+                  isGoalComplete: seasonCheck.isGoalComplete,
                   totalDonated: seasonCheck.totalDonated,
                   goalAmount: seasonCheck.goalAmount
                 } : undefined,

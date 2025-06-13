@@ -33,11 +33,24 @@ const verifyMoralisSignature = async (req, res, next) => {
   }
 };
 
+// Function to clean webhook data for logging
+function cleanWebhookDataForLogging(data) {
+  const cleaned = { ...data };
+  if (cleaned.txs) {
+    cleaned.txs = cleaned.txs.map(tx => {
+      const cleanedTx = { ...tx };
+      cleanedTx.input = "";
+      return cleanedTx;
+    });
+  }
+  return cleaned;
+}
+
 // Handle webhook events from Moralis
 router.post('/moralis', async (req, res) => {
   try {
-    // Log the request body
-    console.log('Received webhook from Moralis:', req.body);
+    // Log the cleaned request body
+    console.log('Received webhook from Moralis:', cleanWebhookDataForLogging(req.body));
     
     // Check if this is a verification request
     if (req.body.verified === false || req.body.tag === 'verification') {
@@ -95,7 +108,6 @@ async function processWebhookData(webhookData) {
     
     // Log the first 500 chars of the webhook data to avoid console flooding
     const webhookDataString = JSON.stringify(webhookData);
-    console.log('Received webhook data (truncated):', webhookDataString.substring(0, 500) + (webhookDataString.length > 500 ? '...' : ''));
     
     // IMPORTANT: Capture ALL logs and events, then filter locally
     // -------------- Process Contract Logs (for ERC20 Transfers) --------------
@@ -315,7 +327,9 @@ async function processWebhookData(webhookData) {
   }
 }
 
+// Export both the router and the cleaning function
 module.exports = {
   router,
-  processWebhookData
+  processWebhookData,
+  cleanWebhookDataForLogging
 };

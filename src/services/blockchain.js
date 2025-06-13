@@ -252,13 +252,8 @@ class BlockchainService {
           }
           
           if (BigInt(allowance) < BigInt(usdcAmounts[i])) {
-            console.log(`Insufficient allowance for ${froms[i]}: has ${allowance}, needs ${usdcAmounts[i]}`);
-            // Filter out this donation
-            froms.splice(i, 1);
-            tos.splice(i, 1);
-            donationTimes.splice(i, 1);
-            usdcAmounts.splice(i, 1);
-            i--; // Adjust index since we removed an element
+            console.log(`Adjusting donation amount for ${froms[i]}: from ${usdcAmounts[i]} to ${allowance} (remaining allowance)`);
+            usdcAmounts[i] = allowance.toString();
           }
         }
         

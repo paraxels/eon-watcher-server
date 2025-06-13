@@ -27,7 +27,7 @@ app.get('/', (req, res) => {
 
 // Direct Moralis webhook endpoint for verification
 app.post('/api/webhooks/moralis-webhook', (req, res) => {
-  console.log('Received webhook from Moralis:', req.body);
+  // console.log('Received webhook from Moralis:', req.body);
   
   // Always respond with 200 OK for webhook verification
   res.status(200).send('Webhook received');

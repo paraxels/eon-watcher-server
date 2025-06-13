@@ -31,7 +31,7 @@ class SeasonGoalService {
           // If the value is too small to be a proper USDC base unit representation,
           // then it's likely in whole dollars and needs conversion
           if (Number(season.dollarAmount) < 1000) {
-            season.dollarAmount = (Number(season.dollarAmount) * 1000000).toString();
+            // season.dollarAmount = (Number(season.dollarAmount) * 1000000).toString();
             console.log(`IMPORTANT: Converted season goal amount from ${rawDollarAmount} USD to ${season.dollarAmount} USDC base units`);
           }
         }
@@ -179,22 +179,6 @@ class SeasonGoalService {
    * @returns {Promise<Object>} Result with adjusted donation amount and season information
    */
   async checkAndAdjustDonation(walletAddress, proposedAmount) {
-  // EMERGENCY FIX: Return the EXACT structure expected by processTransactionQueue
-  // Looking at the code in processTransactionQueue, it expects { success: true, season: {...} }
-  console.log(`COMPLETE FIX: Returning properly structured response for ${walletAddress}`);
-  
-  // This is what processTransactionQueue expects
-  return {
-    success: true,  // This is the field being checked in processTransactionQueue
-    season: { active: true },  // Ensures the season check passes
-    needsAdjustment: false,
-    adjustedAmount: proposedAmount.toString(),
-    proposedAmount: proposedAmount.toString(),
-    seasonId: null,
-    isGoalComplete: false
-  };
-  
-  // Original implementation is bypassed to fix critical errors
     try {
       // Convert proposed amount to BigInt if it's a string
       const proposedAmountBigInt = typeof proposedAmount === 'string' ? 
@@ -233,7 +217,6 @@ class SeasonGoalService {
         active: season.active
       })}`);
       
-
       // Determine season timeframe - FIXED: Use document creation time instead of 0
       // Get creation date from MongoDB _id (ObjectId contains creation timestamp)
       const seasonCreationDate = season._id.getTimestamp();
@@ -319,11 +302,7 @@ class SeasonGoalService {
         goalAmount: goalAmount.toString()
       };
     } catch (error) {
-      console.error(`Error in checkAndAdjustDonation for wallet ${walletAddress}: ${error.message}`);
-      console.error(error.stack); // Log the full stack trace for debugging
-      
-      // Return a fallback response that allows the donation to proceed
-      // This ensures a failure here doesn't block donations
+      console.error(`Error checking and adjusting donation for wallet ${walletAddress}:`, error);
       return {
         needsAdjustment: false,
         adjustedAmount: proposedAmount.toString(),
@@ -408,17 +387,19 @@ class SeasonGoalService {
    */
   async markSeasonCompleted(seasonId) {
     try {
+      const currentTimestamp = Math.floor(Date.now() / 1000);
       const result = await ExistingWallet.findByIdAndUpdate(
         seasonId,
         { 
           active: false,
           completed: true,
           completedDate: new Date(),
-          lastUpdated: new Date()
+          lastUpdated: new Date(),
+          lastDonation: currentTimestamp
         }
       );
       
-      console.log(`Marked season ${seasonId} as completed`);
+      console.log(`Marked season ${seasonId} as completed with lastDonation=${currentTimestamp}`);
       return true;
     } catch (error) {
       console.error(`Error marking season ${seasonId} as completed:`, error);
