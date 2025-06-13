@@ -269,6 +269,23 @@ class SeasonGoalService {
       // Check if adding the proposed amount would exceed the goal
       const totalAfterDonation = totalDonatedSoFar + proposedAmountBigInt;
       
+      // Check if this donation would exactly meet the goal
+      if (totalAfterDonation === goalAmount) {
+        console.log(`Donation of ${proposedAmountBigInt} would exactly meet the goal for wallet ${walletAddress}`);
+        await this.markSeasonCompleted(season._id);
+        
+        return {
+          needsAdjustment: false, // No adjustment needed as it's exactly the right amount
+          adjustedAmount: proposedAmountBigInt.toString(),
+          proposedAmount: proposedAmountBigInt.toString(),
+          seasonId: season._id,
+          isGoalComplete: true, // This donation will complete the goal exactly
+          totalDonated: totalDonatedSoFar.toString(),
+          goalAmount: goalAmount.toString()
+        };
+      }
+      
+      // Check if the donation would exceed the goal
       if (totalAfterDonation > goalAmount) {
         // Calculate how much is needed to exactly hit the goal
         const amountNeeded = goalAmount - totalDonatedSoFar;
@@ -410,9 +427,10 @@ class SeasonGoalService {
       );
       
       console.log(`Marked season ${seasonId} as completed with lastDonation=${currentTimestamp}`);
+      console.log('Conditionals for sending notifications:', season.fid, season.active);
 
       // Send notification if we have a FID
-      if (season.fid) {
+      if (season.fid && !season.active) {
         try {
           await sendSeasonCompletionNotification(season.fid);
           console.log(`Sent season completion notification to FID ${season.fid}`);

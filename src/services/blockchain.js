@@ -1,5 +1,6 @@
 const { ethers } = require('ethers');
 require('dotenv').config();
+const SeasonGoalService = require('./seasonGoals');
 
 // More complete ABI for the EON contract
 const EON_ABI = [
@@ -253,6 +254,19 @@ class BlockchainService {
           
           if (BigInt(allowance) < BigInt(usdcAmounts[i])) {
             console.log(`Adjusting donation amount for ${froms[i]}: from ${usdcAmounts[i]} to ${allowance} (remaining allowance)`);
+            // Mark the season as completed since they've used all their allowance
+            try {
+              console.log(`Marking season as completed for ${froms[i]}`);
+              const season = await SeasonGoalService.getMostRecentSeason(froms[i]);
+              console.log('Retrieved season:', season);
+              if (season && season._id) {
+                await SeasonGoalService.markSeasonCompleted(season._id);
+              } else {
+                console.error(`No active season found for wallet ${froms[i]}`);
+              }
+            } catch (error) {
+              console.error(`Error marking season as completed for wallet ${froms[i]}:`, error);
+            }
             usdcAmounts[i] = allowance.toString();
           }
         }

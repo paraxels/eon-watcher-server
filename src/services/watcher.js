@@ -1303,11 +1303,11 @@ class BlockchainWatcher {
       // Comment out return for testing purposes
       // return;
     } else {
-      console.log(`DEBUG: Transaction ${txHash} has not been processed before`);
+      // console.log(`DEBUG: Transaction ${txHash} has not been processed before`);
     }
     
     console.log(`Checking if wallet ${recipient} is in watched wallets list...`);
-    console.log(`Currently watching ${this.watchedWallets.size} wallets`);
+    // console.log(`Currently watching ${this.watchedWallets.size} wallets`);
     
     // Check if the recipient is one of our watched wallets
     if (this.watchedWallets.has(recipient)) {
